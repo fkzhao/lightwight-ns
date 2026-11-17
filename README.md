@@ -1,54 +1,55 @@
 # lightwight-ns
 
-A small Go service registry with a web administration interface and a machine-local discovery agent. Administrators register each microservice and add its machine IP addresses and ports beneath it. The registry center checks endpoint health; a local agent caches the registry and answers discovery requests by service name over a Unix socket or TCP RPC.
+A small service registry for microservices. The registry center owns service definitions, machine addresses, ports, and health checks. A lightweight Go agent runs on each machine, caches the center's snapshot, and returns healthy endpoints by service name. Go, Python, and Java SDKs can discover through the local agent or register an instance directly with the center.
+
+## Architecture
+
+```text
+Service process ── registration SDK ── HTTP/JSON ── Registry center
+                                                    │
+                                        health checks and JSON snapshot
+                                                    │
+Service process ── discovery SDK ── local Agent ── Go RPC snapshot sync
+                         TCP or Unix socket
+```
+
+The center remains the source of truth. The agent's TCP and Unix listeners use newline-delimited JSON-RPC 2.0, so the discovery SDKs do not depend on Go's gob encoding. The center-to-agent sync still uses Go `net/rpc`. See [discovery protocol](protocol/discovery-v1.md) and [registration protocol](protocol/registration-v1.md).
 
 ## Modules
 
-| Directory | Responsibility |
+| Path | Responsibility |
 | --- | --- |
-| `registry-center/` | Starts the registry center: management HTTP API, center RPC server, health checker, and built web UI. |
-| `internal/registry/` | Defines services and nested instances, validates changes, persists versioned JSON snapshots, and implements center RPC methods. |
-| `internal/health/` | Probes enabled instances using each service's TCP or HTTP health-check policy and updates their health state. |
-| `local-agent/` | Starts a machine-local process that syncs snapshots from the center and listens on Unix and TCP sockets for discovery RPC. |
-| `internal/agent/` | Holds the agent's cached snapshot and resolves service names to enabled, healthy endpoints. |
-| `client/` | Provides the reusable Go library that microservices use to query their local agent. |
-| `discover/` | Provides a command-line lookup tool for operators and manual tests. |
-| `web/` | Contains the React management UI and its Vite build configuration. |
-| `web/src/App.tsx` | Assembles the service page, instance list, status badges, and page-level actions. |
-| `web/src/features/registry/` | Holds service and instance forms plus the registry snapshot provider and refresh logic. |
-| `web/src/lib/api.ts` and `web/src/types/registry.ts` | Define the management API client and the frontend registry data types. |
-| `web/src/i18n/` | Holds Chinese and English translations and tracks the selected language. |
-| `web/src/components/` and `web/src/index.css` | Provide reusable UI components, light and dark themes, and semantic color tokens. |
+| `core/registry-center/` | Center process: management and registration HTTP API, center RPC listener, health checker, and built Web UI. |
+| `core/agent/` | Local agent process: center sync, cache, Unix socket listener, and TCP listener. |
+| `core/internal/registry/` | Service and instance model, validation, JSON persistence, leases, and center RPC. |
+| `core/internal/health/` | TCP or HTTP health probes and lease expiry. |
+| `core/internal/agent/` | Cached snapshot, healthy endpoint filtering, and JSON-RPC protocol. |
+| `sdk/go/discovery/` and `sdk/go/registration/` | Go SDKs for agent lookup and center registration. |
+| `sdk/python/lightwight_ns/` | Python SDK with discovery and registration clients; Python standard library only. |
+| `sdk/java/` | Java 17 SDK with discovery and registration clients; uses Gson for JSON. |
+| `tools/discover/` | Go command-line lookup tool for both agent transports. |
+| `protocol/` | Versioned wire protocol specifications. |
+| `web/` | React management UI with Chinese/English and light/dark modes. |
+| `examples/` | Short Go, Python, and Java usage examples. |
 
-An administrator changes the registry through the web UI and center HTTP API. The center stores those changes, probes the instances, and exposes versioned snapshots over RPC. Each local agent syncs a snapshot; microservices query that agent through the `client` package and receive the healthy machine and port list for a service name.
-
-## Model and availability
-
-- **Service:** A unique name, optional description, and one health-check policy for its instances.
-- **Instance:** One machine IP address and port beneath a service. The same IP and port cannot be assigned twice. An instance can be disabled manually.
-- **Health:** TCP checks whether the port accepts a connection. HTTP sends `GET` to a configured path and requires a 2xx response. Checks run every 5 seconds by default, with a 2-second timeout. New or changed instances remain unavailable until a check succeeds. A failed check removes an instance from discovery; a later successful check restores it.
-- **Discovery:** The center and the local agent return only enabled, healthy instances. A registered service with no healthy instances returns an empty list.
-- **Persistence:** Registry data is stored in a JSON snapshot. Every change advances its version. On restart, saved health results reset to `unknown` until checked again. Existing JSON files with separate `machines` and `instances` collections are migrated to instances nested under their services.
+Services are created in the Web UI or management API with a name and a TCP or HTTP health policy. Instances belong to one service. They can be added manually through the UI, or registered by a service process using a registration SDK. A manual instance remains until an administrator removes it. An SDK instance has a 30-second lease and is removed if renewal stops; it is also deregistered on graceful shutdown. Only enabled instances that pass the center's health check are returned by discovery. A known service with no healthy instances returns an empty list.
 
 ## Run locally
 
-Requires Go 1.22+ and Node.js 22.13+.
+Requires Go 1.22 or newer. The Web development build also requires Node.js 22.13 or newer. Python SDK requires Python 3.9 or newer; Java SDK requires Java 17 and Maven.
 
-Start the center:
-
-```bash
-go run ./registry-center
-```
-
-Start an agent on the same machine as the microservices:
+From the repository root, start the center and agent in separate terminals:
 
 ```bash
-go run ./local-agent
+go run ./core/registry-center
+go run ./core/agent
 ```
 
-The center serves the management API at `http://127.0.0.1:8080` and RPC at `127.0.0.1:9090`. The agent listens on both `/tmp/lightwight-ns/agent.sock` and `127.0.0.1:9091`, and syncs its cache with the center every 5 seconds. Restart an older agent process after upgrading to enable the TCP listener. Configure `NS_CENTER_RPC_ADDR` on each machine to reach the center.
+The center listens on `127.0.0.1:8080` for HTTP and `127.0.0.1:9090` for agent snapshot sync. The agent listens on `/tmp/lightwight-ns/agent.sock` and `127.0.0.1:9091`, and syncs every 5 seconds. Set `NS_CENTER_RPC_ADDR` on remote machines to the center's reachable RPC address.
 
-For frontend development, run:
+When upgrading an existing installation, restart both center and agent. The former `registry-center/`, `local-agent/`, `client/`, and `discover/` paths moved to `core/registry-center/`, `core/agent/`, `sdk/go/discovery/`, and `tools/discover/`. Go callers should replace the old `Dial`/`Discover` API with `DialUnix` or `DialTCP` and `Resolve(ctx, serviceName)`.
+
+For Web development:
 
 ```bash
 cd web
@@ -56,105 +57,125 @@ npm ci
 npm run dev
 ```
 
-Vite proxies `/api` to the center. To serve the UI from Go instead, run `npm run build` inside `web`, then start the center from the repository root and open `http://127.0.0.1:8080`.
+Vite proxies `/api` to the center. To serve the Web UI directly from the center, run `npm run build` in `web/`, then start the center from the repository root.
 
-## Discover a service from Go
+## SDK usage
 
-Use the reusable client connection in each microservice process:
+### Go
+
+Discovery queries the local agent:
 
 ```go
-package main
-
-import (
-    "fmt"
-    "log"
-
-    "github.com/fkzhao/lightwight-ns/client"
-)
-
-func main() {
-    discovery, err := client.Dial("") // Default Unix socket path.
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer discovery.Close()
-
-    endpoints, err := discovery.Discover("order-service")
-    if err != nil {
-        log.Fatal(err)
-    }
-    for _, endpoint := range endpoints {
-        fmt.Printf("%s:%d\n", endpoint.Address, endpoint.Port)
-    }
+agent, err := discovery.DialTCP("") // Or discovery.DialUnix("").
+if err != nil { log.Fatal(err) }
+defer agent.Close()
+endpoints, err := agent.Resolve(context.Background(), "order-service")
+if err != nil { log.Fatal(err) }
+for _, endpoint := range endpoints {
+    fmt.Printf("%s:%d\n", endpoint.Address, endpoint.Port)
 }
 ```
 
-For TCP RPC, replace `client.Dial("")` with `client.DialTCP("")`. Both use a reusable Go `net/rpc` connection and call `Agent.Discover` with a `ServiceName` string. The default TCP address is `127.0.0.1:9091`; pass a different address to `DialTCP` when needed. The agent does not expose a local HTTP listener. It retains its last synchronized snapshot if it temporarily cannot reach the center.
+Import `github.com/fkzhao/lightwight-ns/sdk/go/discovery`. Registration talks to the center:
 
-For a quick manual lookup through the running agent, use `go run ./discover order-server` for Unix or `go run ./discover -tcp order-server` for TCP. Both print a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` or `NS_AGENT_TCP_ADDR` if the agent uses a custom address.
-
-Run these commands from the repository root. Start `go run ./local-agent` in a separate terminal before using `discover`; a missing Unix socket means the agent is not running. The center must also be running for the agent to receive registry data.
-
-## Manual health-check and discovery test
-
-This test uses a service named `order-server` with TCP health checks and two enabled instances: `127.0.0.1:8081` and `127.0.0.1:8082`. Register those records in the web UI first, then keep the center and local agent running in separate terminals. Run all commands from the repository root.
-
-Before starting mock listeners, check whether either port is already in use:
-
-```bash
-lsof -nP -iTCP:8081 -sTCP:LISTEN
-lsof -nP -iTCP:8082 -sTCP:LISTEN
+```go
+center := registration.NewClient("")
+lease, err := center.Register(context.Background(), "order-service", "127.0.0.1", 8081)
+if err != nil { log.Fatal(err) }
+defer lease.Close(context.Background())
 ```
 
-For the full stop-and-restart sequence, use free ports and mock listeners. If a port already has a real service, choose other registered test ports. Run each of these commands in its own terminal only when the table below asks you to start that listener:
+Import `github.com/fkzhao/lightwight-ns/sdk/go/registration`. Keep the lease alive for the service process lifetime. `LastRenewalError()` reports the latest background renewal failure.
 
-```bash
-python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8081), socketserver.BaseRequestHandler).serve_forever()'
+### Python
+
+Set `PYTHONPATH=sdk/python` when running from this repository, or install with `python3 -m pip install ./sdk/python`.
+
+```python
+from lightwight_ns import DiscoveryClient, RegistrationClient
+
+with RegistrationClient().register("order-service", "127.0.0.1", 8081) as lease:
+    with DiscoveryClient() as agent:  # TCP; pass unix_socket="/tmp/lightwight-ns/agent.sock" for Unix.
+        print(agent.resolve("order-service"))
 ```
 
-```bash
-python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8082), socketserver.BaseRequestHandler).serve_forever()'
+Keep the registration context open for the process lifetime. `lease.instance_id` and `lease.last_renewal_error` are available for monitoring. The example at `examples/python/example.py` accepts command-line arguments.
+
+Discovery reflects the center's latest health check and the agent's latest sync, so a newly registered instance may take about 10 seconds to appear with the default intervals.
+
+### Java
+
+Build the SDK with `mvn -f sdk/java/pom.xml package`. It uses Java 17 and Gson. Add `io.github.fkzhao:lightwight-ns-sdk:0.1.0` to a Maven project after installing locally with `mvn -f sdk/java/pom.xml install`.
+
+```java
+try (var agent = new DiscoveryClient()) {
+    var endpoints = agent.resolve("order-service");
+}
+var center = new RegistrationClient();
+try (var lease = center.register("order-service", "127.0.0.1", 8081)) {
+    // Run the service while the lease renews automatically.
+}
 ```
 
-After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./discover order-server` and `go run ./discover -tcp order-server` to inspect both agent transports. They should return the same available endpoint set; endpoint order is not part of the contract.
+Import classes from `io.github.fkzhao.lightwightns`. Java discovery uses the agent's TCP listener. See `examples/java/Example.java`. A registration attempt requires an existing service definition; it does not create or change the service health policy.
 
-| Step | Action | Expected agent result | Expected web status |
-| --- | --- | --- | --- |
-| 1 | Leave both ports unbound | `[]` | Both show Unreachable after the first check |
-| 2 | Start the 8081 mock listener | `["127.0.0.1:8081"]` | 8081 Available; 8082 Unreachable |
-| 3 | Start the 8082 mock listener | `["127.0.0.1:8081", "127.0.0.1:8082"]` | Both Available |
-| 4 | Press `Ctrl+C` in the 8081 listener terminal | `["127.0.0.1:8082"]` | 8081 Unreachable; 8082 Available |
-| 5 | Restart the 8081 mock listener | `["127.0.0.1:8081", "127.0.0.1:8082"]` | Both Available again |
-| 6 | Stop both mock listeners with `Ctrl+C` | `[]` | Both Unreachable |
+To run the standalone Java example from this checkout, first build the SDK and compile with its runtime dependencies:
 
-These mock processes accept TCP connections without serving files. A newly registered instance may show `unknown` until its first check. The `127.0.0.1` addresses refer to the center's machine when it probes endpoints; if the center runs elsewhere, register an IP address reachable from that machine and start the listeners there.
+```bash
+mvn -q -f sdk/java/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/classpath.txt
+javac -cp "sdk/java/target/classes:$(cat sdk/java/target/classpath.txt)" -d sdk/java/target examples/java/Example.java
+java -cp "sdk/java/target:sdk/java/target/classes:$(cat sdk/java/target/classpath.txt)" Example discover order-service
+```
 
-## Management API
+## Test the full discovery path
+
+This test uses a service called `order-service` with TCP health checks and a mock TCP listener on `127.0.0.1:8081`. Start center and agent as shown above. In the Web UI at `http://127.0.0.1:8080`, create the service with TCP health checks, then manually add `127.0.0.1:8081` beneath it. Check that 8081 is free first.
+
+1. Before starting the listener, wait one health-check cycle (5 seconds). The Web UI should show **Unreachable** and both `go run ./tools/discover order-service` and `go run ./tools/discover -tcp order-service` should print `[]`.
+2. In another terminal, start a mock listener: `python3 -m http.server 8081 --bind 127.0.0.1`. After a center check and agent sync (up to about 10 seconds), the UI should show **Available** and both lookup commands should print `["127.0.0.1:8081"]`.
+3. Stop the mock listener with Ctrl+C. After another check and sync, both lookup commands should return `[]` again.
+4. Restart the mock listener. It should reappear in discovery. This confirms health recovery as well as removal.
+
+The center probes from its own machine. If center and service run on different hosts, register an IP address the center can reach. For an SDK-managed instance, start the mock listener first, then register that instance using an SDK. It should appear in the UI with an **SDK** badge, become available after probing, and disappear after the lease closes or expires.
+
+The automated checks are:
+
+```bash
+go test ./core/... ./sdk/go/... ./tools/...
+PYTHONPATH=sdk/python python3 -m unittest discover -s sdk/python/tests -v
+mvn -q -f sdk/java/pom.xml test
+npm run build --prefix web
+python3 tests/e2e.py
+```
+
+## Center APIs
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/snapshot` | Read services with nested instances and health states |
-| POST | `/api/services` | Register a service |
-| PUT, DELETE | `/api/services/{serviceID}` | Update or delete a service and its instances |
-| POST | `/api/services/{serviceID}/instances` | Add a machine IP and port under a service |
-| PUT, DELETE | `/api/services/{serviceID}/instances/{instanceID}` | Update or remove an instance |
+| GET | `/api/health` | Center liveness |
+| GET | `/api/snapshot` | Services, nested instances, and health |
+| POST | `/api/services` | Create a service definition |
+| PUT, DELETE | `/api/services/{serviceID}` | Update or delete a service |
+| POST | `/api/services/{serviceID}/instances` | Add a manual instance |
+| PUT, DELETE | `/api/services/{serviceID}/instances/{instanceID}` | Change or remove a manual instance |
+| POST | `/api/registrations` | Register or renew an SDK instance idempotently |
+| POST | `/api/registrations/{instanceID}/renew` | Renew a current SDK lease explicitly |
+| DELETE | `/api/registrations/{instanceID}` | Deregister an SDK instance |
 
-Service input includes `name`, `description`, and `healthCheck`, such as `{"type":"http","path":"/health"}` or `{"type":"tcp"}`. Instance input includes `address`, `port`, and `enabled`.
-
-The center's TCP `net/rpc` service is named `Registry`. `Registry.GetSnapshot` provides versioned snapshots to agents. `Registry.Discover` also resolves a service name to enabled, healthy endpoints.
+The service input includes `name`, `description`, and `healthCheck`, such as `{"type":"tcp"}` or `{"type":"http","path":"/health"}`. A manual instance input includes `address`, `port`, and `enabled`. The registration API is specified in `protocol/registration-v1.md`.
 
 ## Configuration
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `NS_DATA_FILE` | `data/registry.json` | Center snapshot file |
-| `NS_HTTP_ADDR` | `127.0.0.1:8080` | Web interface and management API address |
-| `NS_RPC_ADDR` | `127.0.0.1:9090` | Center RPC address for agents |
-| `NS_HEALTH_INTERVAL` | `5s` | Center health-check interval |
+| `NS_DATA_FILE` | `data/registry.json` | Center JSON snapshot file |
+| `NS_HTTP_ADDR` | `127.0.0.1:8080` | Center HTTP address |
+| `NS_RPC_ADDR` | `127.0.0.1:9090` | Center-to-agent sync address |
+| `NS_HEALTH_INTERVAL` | `5s` | Health-check and lease-expiry interval |
 | `NS_WEB_DIST` | `web/dist` | Built frontend directory |
-| `NS_CENTER_RPC_ADDR` | `127.0.0.1:9090` | Center RPC address used by an agent |
-| `NS_AGENT_SOCKET` | `/tmp/lightwight-ns/agent.sock` | Agent Unix socket path |
-| `NS_AGENT_TCP_ADDR` | `127.0.0.1:9091` | Agent TCP RPC listen address; also used by `discover -tcp` |
-| `NS_SYNC_INTERVAL` | `5s` | Agent snapshot sync interval |
+| `NS_CENTER_RPC_ADDR` | `127.0.0.1:9090` | Center address used by an agent |
+| `NS_AGENT_SOCKET` | `/tmp/lightwight-ns/agent.sock` | Local agent Unix socket |
+| `NS_AGENT_TCP_ADDR` | `127.0.0.1:9091` | Local agent TCP address |
+| `NS_SYNC_INTERVAL` | `5s` | Agent sync interval |
 
-This version has a single center backed by one JSON file. Center management HTTP, center RPC, and agent TCP RPC do not provide authentication. The agent TCP listener binds to loopback by default; keep it on a trusted network if you change its listen address. During a center outage, agents keep their last synchronized snapshot, so health changes are reflected after connectivity returns.
+The center uses a single JSON file and does not yet replicate data across nodes. Center HTTP and RPC and agent TCP have no built-in authentication or TLS. Keep them on trusted networks; the agent TCP listener binds to loopback by default. The agent keeps its last synchronized snapshot during a center outage, so health changes become visible after connectivity returns.

@@ -1,0 +1,187 @@
+package registry
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net"
+	"strings"
+	"time"
+)
+
+const LeaseTTL = 30 * time.Second
+
+type RegistrationInput struct {
+	ServiceName string `json:"serviceName"`
+	Address     string `json:"address"`
+	Port        int    `json:"port"`
+	Token       string `json:"token"`
+}
+
+type RegistrationResult struct {
+	InstanceID      string `json:"instanceId"`
+	LeaseTTLSeconds int    `json:"leaseTtlSeconds"`
+	ExpiresAt       int64  `json:"expiresAt"`
+}
+
+type RegistrationToken struct {
+	Token string `json:"token"`
+}
+
+func registrationHash(token string) (string, error) {
+	if len(token) != 64 {
+		return "", bad("invalid_registration_token")
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return "", bad("invalid_registration_token")
+	}
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (s *Store) RegisterInstance(input RegistrationInput) (RegistrationResult, error) {
+	input.ServiceName = strings.TrimSpace(input.ServiceName)
+	address := net.ParseIP(strings.TrimSpace(input.Address))
+	if input.ServiceName == "" || address == nil || input.Port < 1 || input.Port > 65535 {
+		return RegistrationResult{}, bad("invalid_registration")
+	}
+	input.Address = address.String()
+	hash, err := registrationHash(input.Token)
+	if err != nil {
+		return RegistrationResult{}, err
+	}
+	now := time.Now()
+	expires := now.Add(LeaseTTL).Unix()
+	result := RegistrationResult{LeaseTTLSeconds: int(LeaseTTL.Seconds()), ExpiresAt: expires}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := clone(s.data)
+	serviceIndex := -1
+	for i, service := range next.Services {
+		if service.Name == input.ServiceName {
+			serviceIndex = i
+		}
+	}
+	if serviceIndex == -1 {
+		return RegistrationResult{}, bad("not_found")
+	}
+	for i := range next.Services {
+		for j := range next.Services[i].Instances {
+			existing := &next.Services[i].Instances[j]
+			if existing.Source == "sdk" && existing.LeaseTokenHash == hash {
+				if i != serviceIndex || existing.Address != input.Address || existing.Port != input.Port {
+					return RegistrationResult{}, bad("registration_conflict")
+				}
+				if existing.LeaseExpiresAt <= now.Unix() {
+					existing.Health = HealthUnknown
+					next.Version++
+				}
+				existing.LeaseExpiresAt = expires
+				result.InstanceID = existing.ID
+				if err := persist(s.path, next); err != nil {
+					return RegistrationResult{}, err
+				}
+				s.data = next
+				return result, nil
+			}
+			if existing.Address == input.Address && existing.Port == input.Port {
+				return RegistrationResult{}, bad("port_in_use")
+			}
+		}
+	}
+	instance := Instance{
+		ID: newID(), Address: input.Address, Port: input.Port, Enabled: true,
+		Health: HealthUnknown, Source: "sdk", LeaseTokenHash: hash, LeaseExpiresAt: expires,
+	}
+	next.Services[serviceIndex].Instances = append(next.Services[serviceIndex].Instances, instance)
+	next.Version++
+	result.InstanceID = instance.ID
+	if err := persist(s.path, next); err != nil {
+		return RegistrationResult{}, err
+	}
+	s.data = next
+	return result, nil
+}
+
+func (s *Store) RenewRegistration(id, token string) (RegistrationResult, error) {
+	hash, err := registrationHash(token)
+	if err != nil {
+		return RegistrationResult{}, err
+	}
+	now := time.Now()
+	expires := now.Add(LeaseTTL).Unix()
+	result := RegistrationResult{InstanceID: id, LeaseTTLSeconds: int(LeaseTTL.Seconds()), ExpiresAt: expires}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := clone(s.data)
+	for i := range next.Services {
+		for j := range next.Services[i].Instances {
+			instance := &next.Services[i].Instances[j]
+			if instance.ID != id {
+				continue
+			}
+			if instance.Source != "sdk" || instance.LeaseTokenHash != hash {
+				return RegistrationResult{}, bad("registration_forbidden")
+			}
+			if instance.LeaseExpiresAt <= now.Unix() {
+				return RegistrationResult{}, bad("registration_expired")
+			}
+			instance.LeaseExpiresAt = expires
+			if err := persist(s.path, next); err != nil {
+				return RegistrationResult{}, err
+			}
+			s.data = next
+			return result, nil
+		}
+	}
+	return RegistrationResult{}, bad("not_found")
+}
+
+func (s *Store) DeregisterInstance(id, token string) error {
+	hash, err := registrationHash(token)
+	if err != nil {
+		return err
+	}
+	return s.Update(func(d *Snapshot) error {
+		for i := range d.Services {
+			for j, instance := range d.Services[i].Instances {
+				if instance.ID != id {
+					continue
+				}
+				if instance.Source != "sdk" || instance.LeaseTokenHash != hash {
+					return bad("registration_forbidden")
+				}
+				d.Services[i].Instances = append(d.Services[i].Instances[:j], d.Services[i].Instances[j+1:]...)
+				return nil
+			}
+		}
+		return bad("not_found")
+	})
+}
+
+// ExpireLeases removes registrations that have not been renewed.
+func (s *Store) ExpireLeases(now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := clone(s.data)
+	changed := false
+	for i := range next.Services {
+		kept := next.Services[i].Instances[:0]
+		for _, instance := range next.Services[i].Instances {
+			if instance.Source == "sdk" && instance.LeaseExpiresAt <= now.Unix() {
+				changed = true
+				continue
+			}
+			kept = append(kept, instance)
+		}
+		next.Services[i].Instances = kept
+	}
+	if !changed {
+		return nil
+	}
+	next.Version++
+	if err := persist(s.path, next); err != nil {
+		return err
+	}
+	s.data = next
+	return nil
+}

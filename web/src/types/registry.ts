@@ -12,6 +12,8 @@ export interface Instance {
   port: number
   enabled: boolean
   health: HealthStatus
+  source?: "sdk"
+  leaseExpiresAt?: number
 }
 
 export interface Service {

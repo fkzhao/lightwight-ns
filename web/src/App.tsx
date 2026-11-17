@@ -71,12 +71,12 @@ function ServiceCard({ service }: { service: Service }) {
               <TableHead className="text-right">{t("common.actions")}</TableHead>
             </TableRow></TableHeader>
             <TableBody>{service.instances.map((instance) => <TableRow key={instance.id}>
-              <TableCell className="font-mono text-xs">{instance.address}</TableCell>
+              <TableCell className="font-mono text-xs"><div className="flex items-center gap-2">{instance.address}{instance.source === "sdk" && <Badge variant="outline">{t("instances.sdkManaged")}</Badge>}</div></TableCell>
               <TableCell className="font-mono text-xs">{instance.port}</TableCell>
               <TableCell><HealthBadge instance={instance} /></TableCell>
               <TableCell><div className="flex justify-end gap-1">
-                <Button variant="ghost" size="icon" aria-label={t("instances.edit")} onClick={() => { setEditingInstance(instance); setInstanceFormOpen(true) }}><Pencil /></Button>
-                <Button variant="ghost" size="icon" aria-label={t("instances.delete")} onClick={() => setDeletingInstance(instance)}><Trash2 /></Button>
+                {instance.source !== "sdk" && <Button variant="ghost" size="icon" aria-label={t("instances.edit")} onClick={() => { setEditingInstance(instance); setInstanceFormOpen(true) }}><Pencil /></Button>}
+                {instance.source !== "sdk" && <Button variant="ghost" size="icon" aria-label={t("instances.delete")} onClick={() => setDeletingInstance(instance)}><Trash2 /></Button>}
               </div></TableCell>
             </TableRow>)}</TableBody>
           </Table>

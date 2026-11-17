@@ -3,3 +3,8 @@ data/
 web/node_modules/
 web/dist/
 web/.vite/
+sdk/java/target/
+**/__pycache__/
+*.pyc
+sdk/python/*.egg-info/
+sdk/python/build/
