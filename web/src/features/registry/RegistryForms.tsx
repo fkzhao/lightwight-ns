@@ -1,4 +1,4 @@
-import { Controller, useForm } from "react-hook-form"
+import { Controller, useForm, useWatch } from "react-hook-form"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useTranslation } from "react-i18next"
 import { z } from "zod"
@@ -11,7 +11,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { useRegistry } from "./RegistryProvider"
-import type { Instance, Machine, Service } from "@/types/registry"
+import type { Instance, Service } from "@/types/registry"
 
 interface OpenProps {
   open: boolean
@@ -20,18 +20,35 @@ interface OpenProps {
 
 export function ServiceFormDialog({ open, onOpenChange, current }: OpenProps & { current?: Service }) {
   const { t } = useTranslation()
-  const { save } = useRegistry()
+  const { saveService } = useRegistry()
   const schema = z.object({
     name: z.string().trim().min(1, t("validation.required")).max(80, t("validation.nameLength")),
     description: z.string().max(300, t("validation.descriptionLength")),
+    healthType: z.enum(["tcp", "http"]),
+    healthPath: z.string().max(200, t("validation.healthPath")),
+  }).superRefine((values, ctx) => {
+    if (values.healthType === "http" && (!values.healthPath.startsWith("/") || values.healthPath.startsWith("//"))) {
+      ctx.addIssue({ code: "custom", path: ["healthPath"], message: t("validation.healthPath") })
+    }
   })
   type Values = z.infer<typeof schema>
   const form = useForm<Values>({
     resolver: zodResolver(schema),
-    defaultValues: { name: current?.name ?? "", description: current?.description ?? "" },
+    defaultValues: {
+      name: current?.name ?? "",
+      description: current?.description ?? "",
+      healthType: current?.healthCheck.type ?? "tcp",
+      healthPath: current?.healthCheck.path || "/health",
+    },
   })
+  const healthType = useWatch({ control: form.control, name: "healthType" })
   const submit = form.handleSubmit(async (values) => {
-    if (await save("services", values, current?.id)) onOpenChange(false)
+    const saved = await saveService({
+      name: values.name,
+      description: values.description,
+      healthCheck: { type: values.healthType, path: values.healthType === "http" ? values.healthPath : "" },
+    }, current?.id)
+    if (saved) onOpenChange(false)
   })
 
   return (
@@ -39,7 +56,7 @@ export function ServiceFormDialog({ open, onOpenChange, current }: OpenProps & {
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{t(current ? "services.edit" : "services.add")}</DialogTitle>
-          <DialogDescription>{t("services.description")}</DialogDescription>
+          <DialogDescription>{t("services.formHelp")}</DialogDescription>
         </DialogHeader>
         <form id="service-form" onSubmit={submit} className="flex flex-col gap-6">
           <FieldGroup>
@@ -53,6 +70,24 @@ export function ServiceFormDialog({ open, onOpenChange, current }: OpenProps & {
               <Textarea id="service-description" aria-invalid={!!form.formState.errors.description} {...form.register("description")} />
               <FieldError errors={[form.formState.errors.description]} />
             </Field>
+            <Controller name="healthType" control={form.control} render={({ field }) => (
+              <Field>
+                <FieldLabel htmlFor="health-type">{t("health.type")}</FieldLabel>
+                <Select value={field.value} onValueChange={field.onChange}>
+                  <SelectTrigger id="health-type" className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent><SelectGroup>
+                    <SelectItem value="tcp">{t("health.tcp")}</SelectItem>
+                    <SelectItem value="http">{t("health.http")}</SelectItem>
+                  </SelectGroup></SelectContent>
+                </Select>
+                <FieldDescription>{t("health.typeHelp")}</FieldDescription>
+              </Field>
+            )} />
+            {healthType === "http" && <Field data-invalid={!!form.formState.errors.healthPath}>
+              <FieldLabel htmlFor="health-path">{t("health.path")}</FieldLabel>
+              <Input id="health-path" placeholder="/health" aria-invalid={!!form.formState.errors.healthPath} {...form.register("healthPath")} />
+              <FieldError errors={[form.formState.errors.healthPath]} />
+            </Field>}
           </FieldGroup>
         </form>
         <DialogFooter>
@@ -64,67 +99,14 @@ export function ServiceFormDialog({ open, onOpenChange, current }: OpenProps & {
   )
 }
 
-export function MachineFormDialog({ open, onOpenChange, current }: OpenProps & { current?: Machine }) {
-  const { t } = useTranslation()
-  const { save } = useRegistry()
-  const schema = z.object({
-    name: z.string().trim().min(1, t("validation.required")).max(80, t("validation.nameLength")),
-    address: z.string().trim().min(1, t("validation.address")),
-    description: z.string().max(300, t("validation.descriptionLength")),
-  })
-  type Values = z.infer<typeof schema>
-  const form = useForm<Values>({
-    resolver: zodResolver(schema),
-    defaultValues: { name: current?.name ?? "", address: current?.address ?? "", description: current?.description ?? "" },
-  })
-  const submit = form.handleSubmit(async (values) => {
-    if (await save("machines", values, current?.id)) onOpenChange(false)
-  })
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{t(current ? "machines.edit" : "machines.add")}</DialogTitle>
-          <DialogDescription>{t("machines.description")}</DialogDescription>
-        </DialogHeader>
-        <form id="machine-form" onSubmit={submit} className="flex flex-col gap-6">
-          <FieldGroup>
-            <Field data-invalid={!!form.formState.errors.name}>
-              <FieldLabel htmlFor="machine-name">{t("machines.name")}</FieldLabel>
-              <Input id="machine-name" placeholder={t("machines.namePlaceholder")} aria-invalid={!!form.formState.errors.name} {...form.register("name")} />
-              <FieldError errors={[form.formState.errors.name]} />
-            </Field>
-            <Field data-invalid={!!form.formState.errors.address}>
-              <FieldLabel htmlFor="machine-address">{t("machines.address")}</FieldLabel>
-              <Input id="machine-address" placeholder={t("machines.addressPlaceholder")} aria-invalid={!!form.formState.errors.address} {...form.register("address")} />
-              <FieldError errors={[form.formState.errors.address]} />
-            </Field>
-            <Field data-invalid={!!form.formState.errors.description}>
-              <FieldLabel htmlFor="machine-description">{t("common.description")}</FieldLabel>
-              <Textarea id="machine-description" aria-invalid={!!form.formState.errors.description} {...form.register("description")} />
-              <FieldError errors={[form.formState.errors.description]} />
-            </Field>
-          </FieldGroup>
-        </form>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-          <Button type="submit" form="machine-form" disabled={form.formState.isSubmitting}>{t("common.save")}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-export function InstanceFormDialog({ open, onOpenChange, service, machines, current }: OpenProps & {
+export function InstanceFormDialog({ open, onOpenChange, service, current }: OpenProps & {
   service: Service
-  machines: Machine[]
   current?: Instance
 }) {
   const { t } = useTranslation()
-  const { save } = useRegistry()
+  const { saveInstance } = useRegistry()
   const schema = z.object({
-    machineId: z.string().min(1, t("validation.machine")),
+    address: z.string().trim().min(1, t("validation.address")),
     port: z.string().regex(/^\d+$/, t("validation.port")).refine((port) => Number(port) >= 1 && Number(port) <= 65535, t("validation.port")),
     enabled: z.boolean(),
   })
@@ -132,41 +114,31 @@ export function InstanceFormDialog({ open, onOpenChange, service, machines, curr
   const form = useForm<Values>({
     resolver: zodResolver(schema),
     defaultValues: {
-      machineId: current?.machineId ?? "",
+      address: current?.address ?? "",
       port: current?.port ? String(current.port) : "",
       enabled: current?.enabled ?? true,
     },
   })
   const submit = form.handleSubmit(async (values) => {
-    const instance = { serviceId: service.id, machineId: values.machineId, port: Number(values.port), enabled: values.enabled }
-    if (await save("instances", instance, current?.id)) onOpenChange(false)
+    if (await saveInstance(service.id, { address: values.address, port: Number(values.port), enabled: values.enabled }, current?.id)) {
+      onOpenChange(false)
+    }
   })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t(current ? "services.editInstance" : "services.addInstance")}</DialogTitle>
+          <DialogTitle>{t(current ? "instances.edit" : "instances.add")}</DialogTitle>
           <DialogDescription>{service.name}</DialogDescription>
         </DialogHeader>
         <form id="instance-form" onSubmit={submit} className="flex flex-col gap-6">
           <FieldGroup>
-            <Controller name="machineId" control={form.control} render={({ field, fieldState }) => (
-              <Field data-invalid={fieldState.invalid}>
-                <FieldLabel htmlFor="instance-machine">{t("instances.machine")}</FieldLabel>
-                <Select value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger id="instance-machine" className="w-full" aria-invalid={fieldState.invalid}>
-                    <SelectValue placeholder={t("instances.selectMachine")} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {machines.map((machine) => <SelectItem key={machine.id} value={machine.id}>{machine.name} · {machine.address}</SelectItem>)}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                <FieldError errors={[fieldState.error]} />
-              </Field>
-            )} />
+            <Field data-invalid={!!form.formState.errors.address}>
+              <FieldLabel htmlFor="instance-address">{t("instances.address")}</FieldLabel>
+              <Input id="instance-address" placeholder={t("instances.addressPlaceholder")} aria-invalid={!!form.formState.errors.address} {...form.register("address")} />
+              <FieldError errors={[form.formState.errors.address]} />
+            </Field>
             <Field data-invalid={!!form.formState.errors.port}>
               <FieldLabel htmlFor="instance-port">{t("instances.port")}</FieldLabel>
               <Input id="instance-port" inputMode="numeric" placeholder={t("instances.portPlaceholder")} aria-invalid={!!form.formState.errors.port} {...form.register("port")} />
@@ -174,9 +146,9 @@ export function InstanceFormDialog({ open, onOpenChange, service, machines, curr
             </Field>
             <Controller name="enabled" control={form.control} render={({ field }) => (
               <Field orientation="horizontal">
-                <FieldLabel htmlFor="instance-enabled">{t("instances.status")}</FieldLabel>
+                <FieldLabel htmlFor="instance-enabled">{t("instances.enabled")}</FieldLabel>
                 <Switch id="instance-enabled" checked={field.value} onCheckedChange={field.onChange} />
-                <FieldDescription>{t("instances.statusHelp")}</FieldDescription>
+                <FieldDescription>{t("instances.enabledHelp")}</FieldDescription>
               </Field>
             )} />
           </FieldGroup>
@@ -190,13 +162,13 @@ export function InstanceFormDialog({ open, onOpenChange, service, machines, curr
   )
 }
 
-export function DeleteDialog({ open, onOpenChange, kind, id, description }: OpenProps & {
-  kind: "services" | "machines" | "instances"
-  id: string
+export function DeleteDialog({ open, onOpenChange, serviceId, instanceId, description }: OpenProps & {
+  serviceId: string
+  instanceId?: string
   description: string
 }) {
   const { t } = useTranslation()
-  const { remove } = useRegistry()
+  const { removeService, removeInstance } = useRegistry()
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
@@ -208,7 +180,8 @@ export function DeleteDialog({ open, onOpenChange, kind, id, description }: Open
           <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
           <AlertDialogAction variant="destructive" onClick={async (event) => {
             event.preventDefault()
-            if (await remove(kind, id)) onOpenChange(false)
+            const removed = instanceId ? await removeInstance(serviceId, instanceId) : await removeService(serviceId)
+            if (removed) onOpenChange(false)
           }}>{t("common.delete")}</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

@@ -1,8 +1,7 @@
-import type { RegistrySnapshot } from "@/types/registry"
+import type { HealthCheck, Instance, RegistrySnapshot, Service } from "@/types/registry"
 
 export class ApiError extends Error {
   code: string
-
   constructor(code: string) {
     super(code)
     this.code = code
@@ -27,13 +26,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+export type ServiceInput = Pick<Service, "name" | "description"> & { healthCheck: HealthCheck }
+export type InstanceInput = Pick<Instance, "address" | "port" | "enabled">
+
 export const api = {
   snapshot: () => request<RegistrySnapshot>("/snapshot"),
-  save: <T>(kind: "services" | "machines" | "instances", value: T, id?: string) =>
-    request<T>("/" + kind + (id ? "/" + id : ""), {
+  saveService: (value: ServiceInput, id?: string) =>
+    request<Service>("/services" + (id ? "/" + id : ""), {
       method: id ? "PUT" : "POST",
       body: JSON.stringify(value),
     }),
-  remove: (kind: "services" | "machines" | "instances", id: string) =>
-    request<void>("/" + kind + "/" + id, { method: "DELETE" }),
+  removeService: (id: string) => request<void>("/services/" + id, { method: "DELETE" }),
+  saveInstance: (serviceId: string, value: InstanceInput, id?: string) =>
+    request<Instance>("/services/" + serviceId + "/instances" + (id ? "/" + id : ""), {
+      method: id ? "PUT" : "POST",
+      body: JSON.stringify(value),
+    }),
+  removeInstance: (serviceId: string, id: string) =>
+    request<void>("/services/" + serviceId + "/instances/" + id, { method: "DELETE" }),
 }

@@ -1,12 +1,14 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestStorePersistenceAndPortReservation(t *testing.T) {
+func TestServiceEndpointsAndHealthPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store, err := NewStore(path)
 	if err != nil {
@@ -16,25 +18,40 @@ func TestStorePersistenceAndPortReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	machine, err := store.SaveMachine("", Machine{Name: "node-1", Address: "10.0.0.1"})
+	instance, err := store.SaveInstance(service.ID, "", Instance{Address: "10.0.0.1", Port: 8080, Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := store.SaveInstance("", Instance{ServiceID: service.ID, MachineID: machine.ID, Port: 8080, Enabled: true})
-	if err != nil {
+	if instance.Health != HealthUnknown {
+		t.Fatalf("new instance health = %s", instance.Health)
+	}
+	if err := store.ApplyHealth(store.Snapshot().Version, map[string]string{instance.ID: HealthHealthy}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = store.SaveInstance("", Instance{ServiceID: service.ID, MachineID: machine.ID, Port: 8080})
+	if store.Snapshot().Services[0].Instances[0].Health != HealthHealthy {
+		t.Fatal("health did not update")
+	}
+	version := store.Snapshot().Version
+	if err := store.ApplyHealth(version-1, map[string]string{instance.ID: HealthUnhealthy}); err != nil {
+		t.Fatal(err)
+	}
+	if store.Snapshot().Services[0].Instances[0].Health != HealthHealthy {
+		t.Fatal("stale health observation overwrote current state")
+	}
+	if err := store.ApplyHealth(store.Snapshot().Version, map[string]string{instance.ID: HealthHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	if store.Snapshot().Version != version {
+		t.Fatal("unchanged health bumped the version")
+	}
+	_, err = store.SaveInstance(service.ID, "", Instance{Address: "10.0.0.1", Port: 8080, Enabled: true})
 	var domain DomainError
 	if !errors.As(err, &domain) || domain.Code != "port_in_use" {
 		t.Fatalf("expected port_in_use, got %v", err)
 	}
-	if err := store.DeleteMachine(machine.ID); !errors.As(err, &domain) || domain.Code != "machine_has_instances" {
-		t.Fatalf("expected machine_has_instances, got %v", err)
-	}
 	copy := store.Snapshot()
-	copy.Services[0].Name = "changed"
-	if store.Snapshot().Services[0].Name != "orders" {
+	copy.Services[0].Instances[0].Address = "changed"
+	if store.Snapshot().Services[0].Instances[0].Address != "10.0.0.1" {
 		t.Fatal("snapshot exposed mutable state")
 	}
 	reloaded, err := NewStore(path)
@@ -42,7 +59,32 @@ func TestStorePersistenceAndPortReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := reloaded.Snapshot()
-	if got.Version != 3 || len(got.Instances) != 1 || got.Instances[0].ID != instance.ID {
-		t.Fatalf("unexpected persisted snapshot: %+v", got)
+	if got.Version != version+1 || len(got.Services[0].Instances) != 1 || got.Services[0].Instances[0].Health != HealthUnknown {
+		t.Fatalf("unexpected reloaded snapshot: %+v", got)
+	}
+}
+
+func TestLegacySnapshotMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	legacy := map[string]any{
+		"version":   7,
+		"services":  []map[string]any{{"id": "service-1", "name": "orders", "description": ""}},
+		"machines":  []map[string]any{{"id": "machine-1", "name": "node-1", "address": "10.0.0.1"}},
+		"instances": []map[string]any{{"id": "instance-1", "serviceId": "service-1", "machineId": "machine-1", "port": 8080, "enabled": true}},
+	}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := store.Snapshot()
+	if got.Version != 8 || got.Services[0].Instances[0].Address != "10.0.0.1" || got.Services[0].HealthCheck.Type != "tcp" {
+		t.Fatalf("legacy data was not preserved: %+v", got)
 	}
 }

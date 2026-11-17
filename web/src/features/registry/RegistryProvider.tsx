@@ -3,17 +3,18 @@ import type { ReactNode } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { api, ApiError } from "@/lib/api"
-import type { RegistrySnapshot } from "@/types/registry"
-
-type Kind = "services" | "machines" | "instances"
+import type { InstanceInput, ServiceInput } from "@/lib/api"
+import type { RegistrySnapshot, Service } from "@/types/registry"
 
 interface RegistryContextValue {
   snapshot: RegistrySnapshot | null
   loading: boolean
   error: string | null
   refresh: () => Promise<void>
-  save: <T>(kind: Kind, value: T, id?: string) => Promise<boolean>
-  remove: (kind: Kind, id: string) => Promise<boolean>
+  saveService: (value: ServiceInput, id?: string) => Promise<Service | null>
+  removeService: (id: string) => Promise<boolean>
+  saveInstance: (serviceId: string, value: InstanceInput, id?: string) => Promise<boolean>
+  removeInstance: (serviceId: string, id: string) => Promise<boolean>
 }
 
 const RegistryContext = createContext<RegistryContextValue | null>(null)
@@ -47,10 +48,7 @@ export function RegistryProvider({ children }: { children: ReactNode }) {
     let cancelled = false
     void api.snapshot()
       .then((next) => {
-        if (!cancelled) {
-          setSnapshot(next)
-          setError(null)
-        }
+        if (!cancelled) { setSnapshot(next); setError(null) }
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(message(cause))
@@ -61,9 +59,38 @@ export function RegistryProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true }
   }, [message])
 
-  const save = async <T,>(kind: Kind, value: T, id?: string) => {
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refresh() }, 5000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+
+  const saveService = async (value: ServiceInput, id?: string) => {
     try {
-      await api.save(kind, value, id)
+      const saved = await api.saveService(value, id)
+      await refresh()
+      toast.success(t("common.saved"))
+      return saved
+    } catch (cause) {
+      toast.error(message(cause))
+      return null
+    }
+  }
+
+  const removeService = async (id: string) => {
+    try {
+      await api.removeService(id)
+      await refresh()
+      toast.success(t("common.deleted"))
+      return true
+    } catch (cause) {
+      toast.error(message(cause))
+      return false
+    }
+  }
+
+  const saveInstance = async (serviceId: string, value: InstanceInput, id?: string) => {
+    try {
+      await api.saveInstance(serviceId, value, id)
       await refresh()
       toast.success(t("common.saved"))
       return true
@@ -73,9 +100,9 @@ export function RegistryProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  const remove = async (kind: Kind, id: string) => {
+  const removeInstance = async (serviceId: string, id: string) => {
     try {
-      await api.remove(kind, id)
+      await api.removeInstance(serviceId, id)
       await refresh()
       toast.success(t("common.deleted"))
       return true
@@ -86,7 +113,7 @@ export function RegistryProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <RegistryContext.Provider value={{ snapshot, loading, error, refresh, save, remove }}>
+    <RegistryContext.Provider value={{ snapshot, loading, error, refresh, saveService, removeService, saveInstance, removeInstance }}>
       {children}
     </RegistryContext.Provider>
   )

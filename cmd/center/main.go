@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fkzhao/lightwight-ns/internal/health"
 	"github.com/fkzhao/lightwight-ns/internal/registry"
 )
 
@@ -29,6 +31,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	interval, err := time.ParseDuration(env("NS_HEALTH_INTERVAL", "5s"))
+	if err != nil || interval <= 0 {
+		log.Fatal("NS_HEALTH_INTERVAL must be a positive duration")
+	}
+	go (&health.Checker{Store: store, Interval: interval}).Run(context.Background())
 	rpcServer := rpc.NewServer()
 	if err := rpcServer.RegisterName("Registry", &registry.RPCServer{Store: store}); err != nil {
 		log.Fatal(err)
@@ -48,20 +55,8 @@ func main() {
 	mux.HandleFunc("GET /api/snapshot", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, store.Snapshot())
 	})
-	for _, kind := range []string{"services", "machines", "instances"} {
-		kind := kind
-		mux.HandleFunc("/api/"+kind, func(w http.ResponseWriter, r *http.Request) {
-			handleResource(store, kind, "", w, r)
-		})
-		mux.HandleFunc("/api/"+kind+"/", func(w http.ResponseWriter, r *http.Request) {
-			id := strings.TrimPrefix(r.URL.Path, "/api/"+kind+"/")
-			if id == "" || strings.Contains(id, "/") {
-				writeError(w, http.StatusNotFound, "not_found")
-				return
-			}
-			handleResource(store, kind, id, w, r)
-		})
-	}
+	mux.HandleFunc("/api/services", func(w http.ResponseWriter, r *http.Request) { handleResource(store, w, r) })
+	mux.HandleFunc("/api/services/", func(w http.ResponseWriter, r *http.Request) { handleResource(store, w, r) })
 	serveFrontend(mux, env("NS_WEB_DIST", "web/dist"))
 	addr := env("NS_HTTP_ADDR", "127.0.0.1:8080")
 	log.Printf("HTTP listening on %s", addr)
@@ -89,74 +84,97 @@ func serveFrontend(mux *http.ServeMux, dir string) {
 	})
 }
 
-func handleResource(store *registry.Store, kind, id string, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete {
-		w.Header().Set("Allow", "POST, PUT, DELETE")
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+func handleResource(store *registry.Store, w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/services")
+	if path == "" {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		var input registry.Service
+		if !decode(w, r, &input) {
+			return
+		}
+		item, err := store.SaveService("", input)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, item)
 		return
 	}
-	if r.Method == http.MethodPost && id != "" || r.Method != http.MethodPost && id == "" {
+	if !strings.HasPrefix(path, "/") {
 		writeError(w, http.StatusNotFound, "not_found")
 		return
 	}
-	if r.Method == http.MethodDelete {
-		var err error
-		switch kind {
-		case "services":
-			err = store.DeleteService(id)
-		case "machines":
-			err = store.DeleteMachine(id)
-		case "instances":
-			err = store.DeleteInstance(id)
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	for _, part := range parts {
+		if part == "" {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
 		}
+	}
+	serviceID := parts[0]
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPut:
+			var input registry.Service
+			if !decode(w, r, &input) {
+				return
+			}
+			item, err := store.SaveService(serviceID, input)
+			if err != nil {
+				respondError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, item)
+		case http.MethodDelete:
+			if err := store.DeleteService(serviceID); err != nil {
+				respondError(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+		return
+	}
+	if parts[1] != "instances" || len(parts) > 3 {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost || len(parts) == 3 && r.Method == http.MethodPut {
+		var input registry.Instance
+		if !decode(w, r, &input) {
+			return
+		}
+		instanceID := ""
+		status := http.StatusCreated
+		if len(parts) == 3 {
+			instanceID = parts[2]
+			status = http.StatusOK
+		}
+		item, err := store.SaveInstance(serviceID, instanceID, input)
 		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, status, item)
+		return
+	}
+	if len(parts) == 3 && r.Method == http.MethodDelete {
+		if err := store.DeleteInstance(serviceID, parts[2]); err != nil {
 			respondError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	status := http.StatusOK
-	if r.Method == http.MethodPost {
-		status = http.StatusCreated
-	}
-	switch kind {
-	case "services":
-		var input registry.Service
-		if !decode(w, r, &input) {
-			return
-		}
-		item, err := store.SaveService(id, input)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, status, item)
-	case "machines":
-		var input registry.Machine
-		if !decode(w, r, &input) {
-			return
-		}
-		item, err := store.SaveMachine(id, input)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, status, item)
-	case "instances":
-		var input registry.Instance
-		if !decode(w, r, &input) {
-			return
-		}
-		item, err := store.SaveInstance(id, input)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, status, item)
-	default:
-		writeError(w, http.StatusNotFound, "not_found")
-	}
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 }
 
 func decode(w http.ResponseWriter, r *http.Request, value any) bool {

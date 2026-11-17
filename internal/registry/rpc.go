@@ -23,7 +23,7 @@ type RPCServer struct{ Store *Store }
 
 func (r *RPCServer) GetSnapshot(req SnapshotRequest, reply *SnapshotReply) error {
 	snapshot := r.Store.Snapshot()
-	reply.Changed = snapshot.Version != req.KnownVersion
+	reply.Changed = req.KnownVersion == 0 || snapshot.Version != req.KnownVersion
 	if reply.Changed {
 		reply.Snapshot = snapshot
 	} else {
@@ -36,26 +36,15 @@ func (r *RPCServer) Discover(req DiscoverRequest, reply *DiscoverReply) error {
 	snapshot := r.Store.Snapshot()
 	reply.Version = snapshot.Version
 	reply.Endpoints = []Endpoint{}
-	serviceID := ""
 	for _, service := range snapshot.Services {
 		if service.Name == req.ServiceName {
-			serviceID = service.ID
-			break
-		}
-	}
-	if serviceID == "" {
-		return DomainError{Code: "not_found"}
-	}
-	for _, instance := range snapshot.Instances {
-		if instance.ServiceID != serviceID || !instance.Enabled {
-			continue
-		}
-		for _, machine := range snapshot.Machines {
-			if machine.ID == instance.MachineID {
-				reply.Endpoints = append(reply.Endpoints, Endpoint{Address: machine.Address, Port: instance.Port})
-				break
+			for _, instance := range service.Instances {
+				if instance.Enabled && instance.Health == HealthHealthy {
+					reply.Endpoints = append(reply.Endpoints, Endpoint{Address: instance.Address, Port: instance.Port})
+				}
 			}
+			return nil
 		}
 	}
-	return nil
+	return DomainError{Code: "not_found"}
 }
