@@ -20,7 +20,7 @@ import type { Instance, Service } from "@/types/registry"
 function HealthBadge({ instance }: { instance: Instance }) {
   const { t } = useTranslation()
   if (!instance.enabled) return <Badge variant="outline">{t("health.disabled")}</Badge>
-  if (instance.health === "healthy") return <Badge variant="secondary">{t("health.healthy")}</Badge>
+  if (instance.health === "healthy") return <Badge variant="success">{t("health.healthy")}</Badge>
   if (instance.health === "unhealthy") return <Badge variant="destructive">{t("health.unhealthy")}</Badge>
   return <Badge variant="outline">{t("health.unknown")}</Badge>
 }

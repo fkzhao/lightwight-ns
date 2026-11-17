@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,8 +17,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: go run ./cmd/discover <service-name>")
 		os.Exit(2)
 	}
-	discovery, err := client.Dial(os.Getenv("NS_AGENT_SOCKET"))
+	socket := os.Getenv("NS_AGENT_SOCKET")
+	if socket == "" {
+		socket = client.DefaultSocketPath
+	}
+	discovery, err := client.Dial(socket)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("local agent socket %s does not exist; start the agent with: go run ./cmd/agent", socket)
+		}
 		log.Fatal(err)
 	}
 	defer discovery.Close()

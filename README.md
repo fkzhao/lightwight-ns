@@ -73,6 +73,8 @@ The local wire protocol is Go `net/rpc` over a Unix socket: `Agent.Discover` acc
 
 For a quick manual lookup through the running agent, use `go run ./cmd/discover order-server`. It prints a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` if the agent uses a custom socket path.
 
+Run both commands from the repository root. Start `go run ./cmd/agent` in a separate terminal before using `cmd/discover`; a missing agent socket means the agent is not running. The center must also be running for the agent to receive registry data.
+
 ## Management API
 
 | Method | Path | Purpose |
