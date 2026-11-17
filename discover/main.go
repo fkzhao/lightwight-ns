@@ -14,7 +14,7 @@ import (
 
 func main() {
 	if len(os.Args) != 2 || os.Args[1] == "" {
-		fmt.Fprintln(os.Stderr, "usage: go run ./cmd/discover <service-name>")
+		fmt.Fprintln(os.Stderr, "usage: go run ./discover <service-name>")
 		os.Exit(2)
 	}
 	socket := os.Getenv("NS_AGENT_SOCKET")
@@ -24,7 +24,7 @@ func main() {
 	discovery, err := client.Dial(socket)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("local agent socket %s does not exist; start the agent with: go run ./cmd/agent", socket)
+			log.Fatalf("local agent socket %s does not exist; start the agent with: go run ./local-agent", socket)
 		}
 		log.Fatal(err)
 	}

@@ -2,6 +2,26 @@
 
 A small Go service registry with a web administration interface and a machine-local discovery agent. Administrators register each microservice and add its machine IP addresses and ports beneath it. The registry center checks endpoint health; a local agent caches the registry and answers discovery requests by service name over a Unix socket.
 
+## Modules
+
+| Directory | Responsibility |
+| --- | --- |
+| `registry-center/` | Starts the registry center: management HTTP API, center RPC server, health checker, and built web UI. |
+| `internal/registry/` | Defines services and nested instances, validates changes, persists versioned JSON snapshots, and implements center RPC methods. |
+| `internal/health/` | Probes enabled instances using each service's TCP or HTTP health-check policy and updates their health state. |
+| `local-agent/` | Starts a machine-local process that syncs snapshots from the center and listens on a Unix socket for discovery RPC. |
+| `internal/agent/` | Holds the agent's cached snapshot and resolves service names to enabled, healthy endpoints. |
+| `client/` | Provides the reusable Go library that microservices use to query their local agent. |
+| `discover/` | Provides a command-line lookup tool for operators and manual tests. |
+| `web/` | Contains the React management UI and its Vite build configuration. |
+| `web/src/App.tsx` | Assembles the service page, instance list, status badges, and page-level actions. |
+| `web/src/features/registry/` | Holds service and instance forms plus the registry snapshot provider and refresh logic. |
+| `web/src/lib/api.ts` and `web/src/types/registry.ts` | Define the management API client and the frontend registry data types. |
+| `web/src/i18n/` | Holds Chinese and English translations and tracks the selected language. |
+| `web/src/components/` and `web/src/index.css` | Provide reusable UI components, light and dark themes, and semantic color tokens. |
+
+An administrator changes the registry through the web UI and center HTTP API. The center stores those changes, probes the instances, and exposes versioned snapshots over RPC. Each local agent syncs a snapshot; microservices query that agent through the `client` package and receive the healthy machine and port list for a service name.
+
 ## Model and availability
 
 - **Service:** A unique name, optional description, and one health-check policy for its instances.
@@ -17,13 +37,13 @@ Requires Go 1.22+ and Node.js 22.13+.
 Start the center:
 
 ```bash
-go run ./cmd/center
+go run ./registry-center
 ```
 
 Start an agent on the same machine as the microservices:
 
 ```bash
-go run ./cmd/agent
+go run ./local-agent
 ```
 
 The center serves the management API at `http://127.0.0.1:8080` and RPC at `127.0.0.1:9090`. The agent listens on `/tmp/lightwight-ns/agent.sock` and syncs its cache with the center every 5 seconds. Configure `NS_CENTER_RPC_ADDR` on each machine to reach the center.
@@ -71,9 +91,9 @@ func main() {
 
 The local wire protocol is Go `net/rpc` over a Unix socket: `Agent.Discover` accepts a `ServiceName` string and returns an endpoint list. There is no local HTTP listener. The agent retains its last synchronized snapshot if it temporarily cannot reach the center.
 
-For a quick manual lookup through the running agent, use `go run ./cmd/discover order-server`. It prints a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` if the agent uses a custom socket path.
+For a quick manual lookup through the running agent, use `go run ./discover order-server`. It prints a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` if the agent uses a custom socket path.
 
-Run both commands from the repository root. Start `go run ./cmd/agent` in a separate terminal before using `cmd/discover`; a missing agent socket means the agent is not running. The center must also be running for the agent to receive registry data.
+Run these commands from the repository root. Start `go run ./local-agent` in a separate terminal before using `discover`; a missing agent socket means the agent is not running. The center must also be running for the agent to receive registry data.
 
 ## Manual health-check and discovery test
 
@@ -96,7 +116,7 @@ python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = Tr
 python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8082), socketserver.BaseRequestHandler).serve_forever()'
 ```
 
-After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./cmd/discover order-server` to inspect the agent's available endpoint list. Compare endpoints as a set; their order is not part of the contract.
+After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./discover order-server` to inspect the agent's available endpoint list. Compare endpoints as a set; their order is not part of the contract.
 
 | Step | Action | Expected agent result | Expected web status |
 | --- | --- | --- | --- |
