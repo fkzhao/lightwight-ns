@@ -75,6 +75,40 @@ For a quick manual lookup through the running agent, use `go run ./cmd/discover 
 
 Run both commands from the repository root. Start `go run ./cmd/agent` in a separate terminal before using `cmd/discover`; a missing agent socket means the agent is not running. The center must also be running for the agent to receive registry data.
 
+## Manual health-check and discovery test
+
+This test uses a service named `order-server` with TCP health checks and two enabled instances: `127.0.0.1:8081` and `127.0.0.1:8082`. Register those records in the web UI first, then keep the center and local agent running in separate terminals. Run all commands from the repository root.
+
+Before starting mock listeners, check whether either port is already in use:
+
+```bash
+lsof -nP -iTCP:8081 -sTCP:LISTEN
+lsof -nP -iTCP:8082 -sTCP:LISTEN
+```
+
+For the full stop-and-restart sequence, use free ports and mock listeners. If a port already has a real service, choose other registered test ports. Run each of these commands in its own terminal only when the table below asks you to start that listener:
+
+```bash
+python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8081), socketserver.BaseRequestHandler).serve_forever()'
+```
+
+```bash
+python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8082), socketserver.BaseRequestHandler).serve_forever()'
+```
+
+After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./cmd/discover order-server` to inspect the agent's available endpoint list. Compare endpoints as a set; their order is not part of the contract.
+
+| Step | Action | Expected agent result | Expected web status |
+| --- | --- | --- | --- |
+| 1 | Leave both ports unbound | `[]` | Both show Unreachable after the first check |
+| 2 | Start the 8081 mock listener | `["127.0.0.1:8081"]` | 8081 Available; 8082 Unreachable |
+| 3 | Start the 8082 mock listener | `["127.0.0.1:8081", "127.0.0.1:8082"]` | Both Available |
+| 4 | Press `Ctrl+C` in the 8081 listener terminal | `["127.0.0.1:8082"]` | 8081 Unreachable; 8082 Available |
+| 5 | Restart the 8081 mock listener | `["127.0.0.1:8081", "127.0.0.1:8082"]` | Both Available again |
+| 6 | Stop both mock listeners with `Ctrl+C` | `[]` | Both Unreachable |
+
+These mock processes accept TCP connections without serving files. A newly registered instance may show `unknown` until its first check. The `127.0.0.1` addresses refer to the center's machine when it probes endpoints; if the center runs elsewhere, register an IP address reachable from that machine and start the listeners there.
+
 ## Management API
 
 | Method | Path | Purpose |
