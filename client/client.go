@@ -4,9 +4,13 @@ package client
 import (
 	"net"
 	"net/rpc"
+	"time"
 )
 
-const DefaultSocketPath = "/tmp/lightwight-ns/agent.sock"
+const (
+	DefaultSocketPath = "/tmp/lightwight-ns/agent.sock"
+	DefaultTCPAddress = "127.0.0.1:9091"
+)
 
 type Endpoint struct {
 	Address string
@@ -20,7 +24,19 @@ func Dial(socketPath string) (*Client, error) {
 	if socketPath == "" {
 		socketPath = DefaultSocketPath
 	}
-	connection, err := net.Dial("unix", socketPath)
+	return dial("unix", socketPath)
+}
+
+// DialTCP opens a reusable TCP RPC connection to the local agent.
+func DialTCP(address string) (*Client, error) {
+	if address == "" {
+		address = DefaultTCPAddress
+	}
+	return dial("tcp", address)
+}
+
+func dial(network, address string) (*Client, error) {
+	connection, err := net.DialTimeout(network, address, 3*time.Second)
 	if err != nil {
 		return nil, err
 	}

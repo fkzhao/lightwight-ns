@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/rpc"
@@ -23,45 +24,57 @@ func env(key, fallback string) string {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	center := env("NS_CENTER_RPC_ADDR", "127.0.0.1:9090")
 	socket := env("NS_AGENT_SOCKET", "/tmp/lightwight-ns/agent.sock")
+	tcpAddress := env("NS_AGENT_TCP_ADDR", "127.0.0.1:9091")
 	interval, err := time.ParseDuration(env("NS_SYNC_INTERVAL", "5s"))
 	if err != nil || interval <= 0 {
-		log.Fatal("NS_SYNC_INTERVAL must be a positive duration")
+		return errors.New("NS_SYNC_INTERVAL must be a positive duration")
 	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0750); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if info, err := os.Lstat(socket); err == nil {
 		if info.Mode()&os.ModeSocket == 0 {
-			log.Fatalf("%s exists and is not a socket", socket)
+			return fmt.Errorf("%s exists and is not a socket", socket)
 		}
 		existing, dialErr := net.DialTimeout("unix", socket, 300*time.Millisecond)
 		if dialErr == nil {
 			existing.Close()
-			log.Fatalf("agent already listening on %s", socket)
+			return fmt.Errorf("agent already listening on %s", socket)
 		}
 		if err := os.Remove(socket); err != nil {
-			log.Fatal(err)
+			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Fatal(err)
+		return err
 	}
-	listener, err := net.Listen("unix", socket)
+	unixListener, err := net.Listen("unix", socket)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer listener.Close()
+	defer unixListener.Close()
 	defer os.Remove(socket)
 	if err := os.Chmod(socket, 0660); err != nil {
-		log.Fatal(err)
+		return err
 	}
+	tcpListener, err := net.Listen("tcp", tcpAddress)
+	if err != nil {
+		return fmt.Errorf("listen on agent TCP address %s: %w", tcpAddress, err)
+	}
+	defer tcpListener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	state := &agent.State{}
 	rpcServer := rpc.NewServer()
 	if err := rpcServer.RegisterName("Agent", &agent.LocalRPC{State: state}); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	go func() {
 		for {
@@ -75,17 +88,23 @@ func main() {
 			}
 		}
 	}()
-	go func() { <-ctx.Done(); listener.Close() }()
-	log.Printf("local agent listening on %s", socket)
+	go func() { <-ctx.Done(); unixListener.Close(); tcpListener.Close() }()
+	log.Printf("local agent listening on unix %s and tcp %s", socket, tcpListener.Addr())
+	go serveRPC(ctx, rpcServer, unixListener)
+	serveRPC(ctx, rpcServer, tcpListener)
+	return nil
+}
+
+func serveRPC(ctx context.Context, server *rpc.Server, listener net.Listener) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("accept local connection: %v", err)
+			log.Printf("accept %s connection: %v", listener.Addr(), err)
 			continue
 		}
-		go rpcServer.ServeConn(connection)
+		go server.ServeConn(connection)
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -13,23 +14,37 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 || os.Args[1] == "" {
-		fmt.Fprintln(os.Stderr, "usage: go run ./discover <service-name>")
+	tcp := flag.Bool("tcp", false, "connect to the agent over TCP RPC")
+	flag.Usage = func() { fmt.Fprintln(os.Stderr, "usage: go run ./discover [-tcp] <service-name>") }
+	flag.Parse()
+	if flag.NArg() != 1 || flag.Arg(0) == "" {
+		flag.Usage()
 		os.Exit(2)
 	}
-	socket := os.Getenv("NS_AGENT_SOCKET")
-	if socket == "" {
-		socket = client.DefaultSocketPath
-	}
-	discovery, err := client.Dial(socket)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("local agent socket %s does not exist; start the agent with: go run ./local-agent", socket)
+	var discovery *client.Client
+	var err error
+	address := ""
+	if *tcp {
+		address = os.Getenv("NS_AGENT_TCP_ADDR")
+		if address == "" {
+			address = client.DefaultTCPAddress
 		}
-		log.Fatal(err)
+		discovery, err = client.DialTCP(address)
+	} else {
+		address = os.Getenv("NS_AGENT_SOCKET")
+		if address == "" {
+			address = client.DefaultSocketPath
+		}
+		discovery, err = client.Dial(address)
+	}
+	if err != nil {
+		if !*tcp && errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("local agent socket %s does not exist; start the agent with: go run ./local-agent", address)
+		}
+		log.Fatalf("connect to local agent at %s: %v", address, err)
 	}
 	defer discovery.Close()
-	endpoints, err := discovery.Discover(os.Args[1])
+	endpoints, err := discovery.Discover(flag.Arg(0))
 	if err != nil {
 		log.Fatal(err)
 	}

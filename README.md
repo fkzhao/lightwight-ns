@@ -1,6 +1,6 @@
 # lightwight-ns
 
-A small Go service registry with a web administration interface and a machine-local discovery agent. Administrators register each microservice and add its machine IP addresses and ports beneath it. The registry center checks endpoint health; a local agent caches the registry and answers discovery requests by service name over a Unix socket.
+A small Go service registry with a web administration interface and a machine-local discovery agent. Administrators register each microservice and add its machine IP addresses and ports beneath it. The registry center checks endpoint health; a local agent caches the registry and answers discovery requests by service name over a Unix socket or TCP RPC.
 
 ## Modules
 
@@ -9,7 +9,7 @@ A small Go service registry with a web administration interface and a machine-lo
 | `registry-center/` | Starts the registry center: management HTTP API, center RPC server, health checker, and built web UI. |
 | `internal/registry/` | Defines services and nested instances, validates changes, persists versioned JSON snapshots, and implements center RPC methods. |
 | `internal/health/` | Probes enabled instances using each service's TCP or HTTP health-check policy and updates their health state. |
-| `local-agent/` | Starts a machine-local process that syncs snapshots from the center and listens on a Unix socket for discovery RPC. |
+| `local-agent/` | Starts a machine-local process that syncs snapshots from the center and listens on Unix and TCP sockets for discovery RPC. |
 | `internal/agent/` | Holds the agent's cached snapshot and resolves service names to enabled, healthy endpoints. |
 | `client/` | Provides the reusable Go library that microservices use to query their local agent. |
 | `discover/` | Provides a command-line lookup tool for operators and manual tests. |
@@ -46,7 +46,7 @@ Start an agent on the same machine as the microservices:
 go run ./local-agent
 ```
 
-The center serves the management API at `http://127.0.0.1:8080` and RPC at `127.0.0.1:9090`. The agent listens on `/tmp/lightwight-ns/agent.sock` and syncs its cache with the center every 5 seconds. Configure `NS_CENTER_RPC_ADDR` on each machine to reach the center.
+The center serves the management API at `http://127.0.0.1:8080` and RPC at `127.0.0.1:9090`. The agent listens on both `/tmp/lightwight-ns/agent.sock` and `127.0.0.1:9091`, and syncs its cache with the center every 5 seconds. Restart an older agent process after upgrading to enable the TCP listener. Configure `NS_CENTER_RPC_ADDR` on each machine to reach the center.
 
 For frontend development, run:
 
@@ -89,11 +89,11 @@ func main() {
 }
 ```
 
-The local wire protocol is Go `net/rpc` over a Unix socket: `Agent.Discover` accepts a `ServiceName` string and returns an endpoint list. There is no local HTTP listener. The agent retains its last synchronized snapshot if it temporarily cannot reach the center.
+For TCP RPC, replace `client.Dial("")` with `client.DialTCP("")`. Both use a reusable Go `net/rpc` connection and call `Agent.Discover` with a `ServiceName` string. The default TCP address is `127.0.0.1:9091`; pass a different address to `DialTCP` when needed. The agent does not expose a local HTTP listener. It retains its last synchronized snapshot if it temporarily cannot reach the center.
 
-For a quick manual lookup through the running agent, use `go run ./discover order-server`. It prints a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` if the agent uses a custom socket path.
+For a quick manual lookup through the running agent, use `go run ./discover order-server` for Unix or `go run ./discover -tcp order-server` for TCP. Both print a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` or `NS_AGENT_TCP_ADDR` if the agent uses a custom address.
 
-Run these commands from the repository root. Start `go run ./local-agent` in a separate terminal before using `discover`; a missing agent socket means the agent is not running. The center must also be running for the agent to receive registry data.
+Run these commands from the repository root. Start `go run ./local-agent` in a separate terminal before using `discover`; a missing Unix socket means the agent is not running. The center must also be running for the agent to receive registry data.
 
 ## Manual health-check and discovery test
 
@@ -116,7 +116,7 @@ python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = Tr
 python3 -c 'import socketserver; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", 8082), socketserver.BaseRequestHandler).serve_forever()'
 ```
 
-After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./discover order-server` to inspect the agent's available endpoint list. Compare endpoints as a set; their order is not part of the contract.
+After each change, allow about 15 seconds for the center health check, agent sync, and web UI refresh. Run `go run ./discover order-server` and `go run ./discover -tcp order-server` to inspect both agent transports. They should return the same available endpoint set; endpoint order is not part of the contract.
 
 | Step | Action | Expected agent result | Expected web status |
 | --- | --- | --- | --- |
@@ -154,6 +154,7 @@ The center's TCP `net/rpc` service is named `Registry`. `Registry.GetSnapshot` p
 | `NS_WEB_DIST` | `web/dist` | Built frontend directory |
 | `NS_CENTER_RPC_ADDR` | `127.0.0.1:9090` | Center RPC address used by an agent |
 | `NS_AGENT_SOCKET` | `/tmp/lightwight-ns/agent.sock` | Agent Unix socket path |
+| `NS_AGENT_TCP_ADDR` | `127.0.0.1:9091` | Agent TCP RPC listen address; also used by `discover -tcp` |
 | `NS_SYNC_INTERVAL` | `5s` | Agent snapshot sync interval |
 
-This version has a single center backed by one JSON file. Center management HTTP and RPC do not provide authentication. Keep them on a trusted network when allowing agents on other machines to connect. During a center outage, agents keep their last synchronized snapshot, so health changes are reflected after connectivity returns.
+This version has a single center backed by one JSON file. Center management HTTP, center RPC, and agent TCP RPC do not provide authentication. The agent TCP listener binds to loopback by default; keep it on a trusted network if you change its listen address. During a center outage, agents keep their last synchronized snapshot, so health changes are reflected after connectivity returns.
