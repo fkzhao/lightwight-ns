@@ -71,6 +71,8 @@ func main() {
 
 The local wire protocol is Go `net/rpc` over a Unix socket: `Agent.Discover` accepts a `ServiceName` string and returns an endpoint list. There is no local HTTP listener. The agent retains its last synchronized snapshot if it temporarily cannot reach the center.
 
+For a quick manual lookup through the running agent, use `go run ./cmd/discover order-server`. It prints a JSON array of healthy `host:port` endpoints. Set `NS_AGENT_SOCKET` if the agent uses a custom socket path.
+
 ## Management API
 
 | Method | Path | Purpose |
