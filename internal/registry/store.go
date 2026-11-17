@@ -84,7 +84,7 @@ func (s *Store) Snapshot() Snapshot {
 	return clone(s.data)
 }
 
-// 每次变更先写入临时文件，再一次性替换内存快照。
+// Update persists a new snapshot through a temporary file before swapping it into memory.
 func (s *Store) Update(change func(*Snapshot) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1,23 +1,23 @@
 # lightwight-ns
 
-Go 服务注册中心与管理后台的第一版。管理员通过 Web 手动登记微服务、机器 IP 和实例端口；本机 agent 可通过只读 RPC 获取带版本号的服务清单。agent 本身尚未实现。
+An initial Go service registry with a web administration interface. Administrators manually register services, machine IP addresses, and instance ports. A local agent can retrieve versioned registry snapshots through read-only RPC. The agent itself has not been implemented yet.
 
-## 当前模型
+## Data model
 
-- **服务**：唯一的服务名称和说明。
-- **机器**：唯一的机器名称、IP 地址和说明。
-- **实例**：一个服务部署在一台机器的一个端口上。相同机器的端口不能重复分配，停用的实例不会出现在 RPC 发现结果里。
-- **清单**：每次成功修改都会递增版本号，并持久化到 JSON 文件。
+- **Service:** A unique service name and description.
+- **Machine:** A unique machine name, IP address, and description.
+- **Instance:** A service deployed on a machine at a specific port. A port can be assigned only once per machine. Disabled instances are excluded from RPC discovery results.
+- **Registry snapshot:** Each successful change increments the version and persists the snapshot to a JSON file.
 
-## 本地运行
+## Run locally
 
-需要 Go 1.22+ 和 Node.js 22.13+。
+Requires Go 1.22+ and Node.js 22.13+.
 
 ```bash
 go run ./cmd/center
 ```
 
-另开终端运行前端开发服务器：
+In another terminal, start the frontend development server:
 
 ```bash
 cd web
@@ -25,33 +25,35 @@ npm ci
 npm run dev
 ```
 
-开发时访问 Vite 输出的地址，`/api` 会代理到 Go 服务。也可以先运行 `npm run build`，再从项目根目录启动 Go 服务，直接访问 `http://127.0.0.1:8080`。此时 Go 会提供 `web/dist` 的静态页面。
+Open the URL printed by Vite. During development, Vite proxies `/api` requests to the Go server. To serve the built frontend directly from Go, run `npm run build` in `web`, then start the Go server from the repository root and open `http://127.0.0.1:8080`.
 
-## 接口
+## Interfaces
 
-管理接口默认监听 `127.0.0.1:8080`：
+The management API listens on `127.0.0.1:8080` by default:
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/snapshot` | 获取完整服务清单 |
-| POST | `/api/services`、`/api/machines`、`/api/instances` | 创建记录 |
-| PUT | `/api/{资源}/{id}` | 修改记录 |
-| DELETE | `/api/{资源}/{id}` | 删除记录 |
+| GET | `/api/snapshot` | Read the complete registry snapshot |
+| POST | `/api/services`, `/api/machines`, `/api/instances` | Create a record |
+| PUT | `/api/{resource}/{id}` | Update a record |
+| DELETE | `/api/{resource}/{id}` | Delete a record |
 
-agent 使用的 `net/rpc` 默认监听 `127.0.0.1:9090`，服务名为 `Registry`：
+`resource` is one of `services`, `machines`, or `instances`.
 
-- `Registry.GetSnapshot`：传入 `registry.SnapshotRequest{KnownVersion}`；版本未变化时 `Changed=false`。每次调用使用新的响应对象。
-- `Registry.Discover`：传入 `registry.DiscoverRequest{ServiceName}`，返回已启用实例的地址和端口。
+The agent-facing `net/rpc` server listens on `127.0.0.1:9090` by default under the service name `Registry`:
 
-RPC 请求和响应类型位于 `internal/registry/rpc.go`，同一 Go module 内的 agent 可以直接复用。
+- `Registry.GetSnapshot` accepts `registry.SnapshotRequest{KnownVersion}`. It returns `Changed=false` when the version has not changed. Use a fresh response object for each call.
+- `Registry.Discover` accepts `registry.DiscoverRequest{ServiceName}` and returns the addresses and ports of enabled instances.
 
-## 配置
+RPC request and response types are defined in `internal/registry/rpc.go` and can be reused by an agent in the same Go module.
 
-| 环境变量 | 默认值 | 说明 |
+## Configuration
+
+| Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `NS_DATA_FILE` | `data/registry.json` | 清单文件 |
-| `NS_HTTP_ADDR` | `127.0.0.1:8080` | Web 与管理 API |
-| `NS_RPC_ADDR` | `127.0.0.1:9090` | agent 读取 RPC |
-| `NS_WEB_DIST` | `web/dist` | 已构建的前端目录 |
+| `NS_DATA_FILE` | `data/registry.json` | Registry snapshot file |
+| `NS_HTTP_ADDR` | `127.0.0.1:8080` | Web interface and management API address |
+| `NS_RPC_ADDR` | `127.0.0.1:9090` | Agent-facing RPC address |
+| `NS_WEB_DIST` | `web/dist` | Built frontend directory |
 
-当前是单中心、单文件存储的 MVP。管理接口和 RPC 尚未加入认证；部署到多机环境时，应先通过受控网络或网关保护接口，再实现中心高可用和 agent 缓存。
+This MVP has one registry center backed by one JSON file. The management API and RPC server do not yet provide authentication. Protect these interfaces with a controlled network or gateway before exposing them to other machines, then add center redundancy and agent caching for a multi-machine deployment.
