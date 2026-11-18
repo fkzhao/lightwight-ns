@@ -54,9 +54,8 @@ func (s *Store) RegisterInstance(input RegistrationInput) (RegistrationResult, e
 	result := RegistrationResult{LeaseTTLSeconds: int(LeaseTTL.Seconds()), ExpiresAt: expires}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := clone(s.data)
 	serviceIndex := -1
-	for i, service := range next.Services {
+	for i, service := range s.data.Services {
 		if service.Name == input.ServiceName {
 			serviceIndex = i
 		}
@@ -64,23 +63,17 @@ func (s *Store) RegisterInstance(input RegistrationInput) (RegistrationResult, e
 	if serviceIndex == -1 {
 		return RegistrationResult{}, bad("not_found")
 	}
-	for i := range next.Services {
-		for j := range next.Services[i].Instances {
-			existing := &next.Services[i].Instances[j]
+	for i := range s.data.Services {
+		for j := range s.data.Services[i].Instances {
+			existing := &s.data.Services[i].Instances[j]
 			if existing.Source == "sdk" && existing.LeaseTokenHash == hash {
 				if i != serviceIndex || existing.Address != input.Address || existing.Port != input.Port {
 					return RegistrationResult{}, bad("registration_conflict")
 				}
-				if existing.LeaseExpiresAt <= now.Unix() {
-					existing.Health = HealthUnknown
-					next.Version++
-				}
-				existing.LeaseExpiresAt = expires
-				result.InstanceID = existing.ID
-				if err := persist(s.path, next); err != nil {
+				if err := s.renewLease(existing, expires, existing.LeaseExpiresAt <= now.Unix()); err != nil {
 					return RegistrationResult{}, err
 				}
-				s.data = next
+				result.InstanceID = existing.ID
 				return result, nil
 			}
 			if existing.Address == input.Address && existing.Port == input.Port {
@@ -88,14 +81,16 @@ func (s *Store) RegisterInstance(input RegistrationInput) (RegistrationResult, e
 			}
 		}
 	}
+	next := clone(s.data)
 	instance := Instance{
 		ID: newID(), Address: input.Address, Port: input.Port, Enabled: true,
 		Health: HealthUnknown, Source: "sdk", LeaseTokenHash: hash, LeaseExpiresAt: expires,
+		ProbeGeneration: 1,
 	}
 	next.Services[serviceIndex].Instances = append(next.Services[serviceIndex].Instances, instance)
 	next.Version++
 	result.InstanceID = instance.ID
-	if err := persist(s.path, next); err != nil {
+	if err := s.commit(next); err != nil {
 		return RegistrationResult{}, err
 	}
 	s.data = next
@@ -112,10 +107,9 @@ func (s *Store) RenewRegistration(id, token string) (RegistrationResult, error) 
 	result := RegistrationResult{InstanceID: id, LeaseTTLSeconds: int(LeaseTTL.Seconds()), ExpiresAt: expires}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := clone(s.data)
-	for i := range next.Services {
-		for j := range next.Services[i].Instances {
-			instance := &next.Services[i].Instances[j]
+	for i := range s.data.Services {
+		for j := range s.data.Services[i].Instances {
+			instance := &s.data.Services[i].Instances[j]
 			if instance.ID != id {
 				continue
 			}
@@ -125,15 +119,44 @@ func (s *Store) RenewRegistration(id, token string) (RegistrationResult, error) 
 			if instance.LeaseExpiresAt <= now.Unix() {
 				return RegistrationResult{}, bad("registration_expired")
 			}
-			instance.LeaseExpiresAt = expires
-			if err := persist(s.path, next); err != nil {
+			if err := s.renewLease(instance, expires, false); err != nil {
 				return RegistrationResult{}, err
 			}
-			s.data = next
 			return result, nil
 		}
 	}
 	return RegistrationResult{}, bad("not_found")
+}
+
+// renewLease changes a single row without cloning or republishing the registry.
+// The caller holds s.mu. Expired leases must pass a new health check.
+func (s *Store) renewLease(instance *Instance, expires int64, expired bool) error {
+	if !expired && instance.LeaseExpiresAt == expires {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("UPDATE instances SET lease_expires_at = ? WHERE id = ?", expires, instance.ID); err != nil {
+		return err
+	}
+	if expired {
+		if _, err := tx.Exec("UPDATE metadata SET value = ? WHERE key = 'version'", s.data.Version+1); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	instance.LeaseExpiresAt = expires
+	if expired {
+		instance.Health = HealthUnknown
+		instance.ProbeGeneration++
+		s.data.Version++
+	}
+	return nil
 }
 
 func (s *Store) DeregisterInstance(id, token string) error {
@@ -179,7 +202,7 @@ func (s *Store) ExpireLeases(now time.Time) error {
 		return nil
 	}
 	next.Version++
-	if err := persist(s.path, next); err != nil {
+	if err := s.commit(next); err != nil {
 		return err
 	}
 	s.data = next

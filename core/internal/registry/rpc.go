@@ -22,13 +22,7 @@ type DiscoverReply struct {
 type RPCServer struct{ Store *Store }
 
 func (r *RPCServer) GetSnapshot(req SnapshotRequest, reply *SnapshotReply) error {
-	snapshot := r.Store.Snapshot()
-	reply.Changed = req.KnownVersion == 0 || snapshot.Version != req.KnownVersion
-	if reply.Changed {
-		reply.Snapshot = snapshot
-	} else {
-		reply.Snapshot = Snapshot{}
-	}
+	reply.Snapshot, reply.Changed = r.Store.SnapshotSince(req.KnownVersion)
 	return nil
 }
 

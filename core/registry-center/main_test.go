@@ -14,7 +14,7 @@ import (
 )
 
 func TestRegistrationHTTPLifecycle(t *testing.T) {
-	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.json"))
+	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestRegistrationHTTPLifecycle(t *testing.T) {
 }
 
 func TestRPCDiscoveryExcludesUnhealthyInstances(t *testing.T) {
-	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.json"))
+	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,5 +92,21 @@ func TestRPCDiscoveryExcludesUnhealthyInstances(t *testing.T) {
 	}
 	if len(discovered.Endpoints) != 1 || discovered.Endpoints[0].Address != "10.0.0.1" {
 		t.Fatalf("unexpected endpoints: %+v", discovered)
+	}
+}
+
+func TestDatabasePathConfiguration(t *testing.T) {
+	t.Setenv("NS_DB_FILE", "")
+	t.Setenv("NS_DATA_FILE", "")
+	if got := databasePath(); got != "data/registry.db" {
+		t.Fatalf("default database path = %s", got)
+	}
+	t.Setenv("NS_DATA_FILE", "/tmp/test/registry.json")
+	if got := databasePath(); got != "/tmp/test/registry.db" {
+		t.Fatalf("legacy database path = %s", got)
+	}
+	t.Setenv("NS_DB_FILE", "/tmp/custom.db")
+	if got := databasePath(); got != "/tmp/custom.db" {
+		t.Fatalf("NS_DB_FILE did not take precedence: %s", got)
 	}
 }

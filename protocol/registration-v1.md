@@ -16,7 +16,7 @@ The token is a random 256-bit secret generated once per lease. Repeating the sam
 {"instanceId":"example-id","leaseTtlSeconds":30,"expiresAt":1790000000}
 ```
 
-`expiresAt` is a Unix timestamp in seconds. The SDKs renew every 10 seconds. A new or changed instance is unavailable until its health check passes. If renewal stops, the center removes the instance during the next health-check cycle after the 30-second lease expires. The SDK may retry registration with the same token after a network outage; a new instance ID can be returned if the old lease has expired.
+`expiresAt` is a Unix timestamp in seconds. The SDKs renew every 10 seconds. A new or changed instance is unavailable until its health check passes. If renewal stops, the center removes the instance after the 30-second lease expires. Expiry runs independently of health probes, normally within one additional second. The SDK may retry registration with the same token after a network outage; a new instance ID can be returned if the old lease has expired.
 
 ## Explicit renewal and deregistration
 

@@ -11,8 +11,11 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fkzhao/lightwight-ns/core/internal/health"
@@ -27,24 +30,47 @@ func env(key, fallback string) string {
 }
 
 func main() {
-	store, err := registry.NewStore(env("NS_DATA_FILE", "data/registry.json"))
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func run() error {
+	store, err := registry.NewStore(databasePath())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
 	interval, err := time.ParseDuration(env("NS_HEALTH_INTERVAL", "5s"))
 	if err != nil || interval <= 0 {
-		log.Fatal("NS_HEALTH_INTERVAL must be a positive duration")
+		return errors.New("NS_HEALTH_INTERVAL must be a positive duration")
 	}
-	go (&health.Checker{Store: store, Interval: interval}).Run(context.Background())
+	timeout, err := time.ParseDuration(env("NS_HEALTH_TIMEOUT", "2s"))
+	if err != nil || timeout <= 0 {
+		return errors.New("NS_HEALTH_TIMEOUT must be a positive duration")
+	}
+	concurrency, err := strconv.Atoi(env("NS_HEALTH_CONCURRENCY", "128"))
+	if err != nil || concurrency < 1 || concurrency > 4096 {
+		return errors.New("NS_HEALTH_CONCURRENCY must be between 1 and 4096")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	checkerDone := make(chan struct{})
+	go func() {
+		defer close(checkerDone)
+		(&health.Checker{Store: store, Interval: interval, Timeout: timeout, Concurrency: concurrency}).Run(ctx)
+	}()
+	defer func() { stop(); <-checkerDone }()
 	rpcServer := rpc.NewServer()
 	if err := rpcServer.RegisterName("Registry", &registry.RPCServer{Store: store}); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	rpcAddr := env("NS_RPC_ADDR", "127.0.0.1:9090")
 	rpcListener, err := net.Listen("tcp", rpcAddr)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	defer rpcListener.Close()
 	go rpcServer.Accept(rpcListener)
 	log.Printf("RPC listening on %s", rpcAddr)
 
@@ -63,7 +89,36 @@ func main() {
 	addr := env("NS_HTTP_ADDR", "127.0.0.1:8080")
 	log.Printf("HTTP listening on %s", addr)
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	log.Fatal(server.ListenAndServe())
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP shutdown: %v", err)
+		}
+	}()
+	err = server.ListenAndServe()
+	stop()
+	<-shutdownDone
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func databasePath() string {
+	if path := os.Getenv("NS_DB_FILE"); path != "" {
+		return path
+	}
+	if path := os.Getenv("NS_DATA_FILE"); path != "" {
+		if strings.HasSuffix(path, ".json") {
+			return strings.TrimSuffix(path, ".json") + ".db"
+		}
+		return path
+	}
+	return "data/registry.db"
 }
 
 func serveFrontend(mux *http.ServeMux, dir string) {

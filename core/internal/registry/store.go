@@ -2,13 +2,9 @@ package registry
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -25,14 +21,15 @@ type HealthCheck struct {
 }
 
 type Instance struct {
-	ID             string `json:"id"`
-	Address        string `json:"address"`
-	Port           int    `json:"port"`
-	Enabled        bool   `json:"enabled"`
-	Health         string `json:"health"`
-	Source         string `json:"source,omitempty"`
-	LeaseTokenHash string `json:"leaseTokenHash,omitempty"`
-	LeaseExpiresAt int64  `json:"leaseExpiresAt,omitempty"`
+	ID              string `json:"id"`
+	Address         string `json:"address"`
+	Port            int    `json:"port"`
+	Enabled         bool   `json:"enabled"`
+	Health          string `json:"health"`
+	Source          string `json:"source,omitempty"`
+	LeaseTokenHash  string `json:"leaseTokenHash,omitempty"`
+	LeaseExpiresAt  int64  `json:"leaseExpiresAt,omitempty"`
+	ProbeGeneration uint64 `json:"-"`
 }
 
 type Service struct {
@@ -55,80 +52,8 @@ func bad(code string) error         { return DomainError{Code: code} }
 
 type Store struct {
 	mu   sync.RWMutex
-	path string
+	db   *sql.DB
 	data Snapshot
-}
-
-func NewStore(path string) (*Store, error) {
-	s := &Store{path: path, data: Snapshot{Services: []Service{}}}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var disk struct {
-		Version  uint64    `json:"version"`
-		Services []Service `json:"services"`
-		Machines []struct {
-			ID      string `json:"id"`
-			Address string `json:"address"`
-		} `json:"machines"`
-		Instances []struct {
-			ID        string `json:"id"`
-			ServiceID string `json:"serviceId"`
-			MachineID string `json:"machineId"`
-			Port      int    `json:"port"`
-			Enabled   bool   `json:"enabled"`
-		} `json:"instances"`
-	}
-	if err := json.Unmarshal(b, &disk); err != nil {
-		return nil, fmt.Errorf("decode registry: %w", err)
-	}
-	s.data = Snapshot{Version: disk.Version, Services: disk.Services}
-	if s.data.Services == nil {
-		s.data.Services = []Service{}
-	}
-	machines := make(map[string]string, len(disk.Machines))
-	for _, machine := range disk.Machines {
-		machines[machine.ID] = machine.Address
-	}
-	for _, old := range disk.Instances {
-		address, ok := machines[old.MachineID]
-		if !ok {
-			return nil, fmt.Errorf("legacy instance %s references a missing machine", old.ID)
-		}
-		found := false
-		for i := range s.data.Services {
-			if s.data.Services[i].ID == old.ServiceID {
-				s.data.Services[i].Instances = append(s.data.Services[i].Instances, Instance{ID: old.ID, Address: address, Port: old.Port, Enabled: old.Enabled})
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("legacy instance %s references a missing service", old.ID)
-		}
-	}
-	for i := range s.data.Services {
-		service := &s.data.Services[i]
-		if service.HealthCheck.Type == "" {
-			service.HealthCheck.Type = "tcp"
-		}
-		if service.Instances == nil {
-			service.Instances = []Instance{}
-		}
-		for j := range service.Instances {
-			service.Instances[j].Health = HealthUnknown
-		}
-	}
-	// A restart invalidates persisted health observations and advances the agent revision.
-	s.data.Version++
-	if err := persist(path, s.data); err != nil {
-		return nil, err
-	}
-	return s, nil
 }
 
 func clone(src Snapshot) Snapshot {
@@ -147,35 +72,14 @@ func (s *Store) Snapshot() Snapshot {
 	return clone(s.data)
 }
 
-func persist(path string, value Snapshot) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
-		return err
+// SnapshotSince avoids cloning the registry when an agent already has its version.
+func (s *Store) SnapshotSince(version uint64) (Snapshot, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if version != 0 && s.data.Version == version {
+		return Snapshot{}, false
 	}
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".registry-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return clone(s.data), true
 }
 
 // Update persists a new snapshot before exposing it to concurrent readers.
@@ -187,7 +91,7 @@ func (s *Store) Update(change func(*Snapshot) error) error {
 		return err
 	}
 	next.Version++
-	if err := persist(s.path, next); err != nil {
+	if err := s.commit(next); err != nil {
 		return err
 	}
 	s.data = next
@@ -217,7 +121,54 @@ func (s *Store) ApplyHealth(observedVersion uint64, results map[string]string) e
 		return nil
 	}
 	next.Version++
-	if err := persist(s.path, next); err != nil {
+	if err := s.commit(next); err != nil {
+		return err
+	}
+	s.data = next
+	return nil
+}
+
+type ProbeObservation struct {
+	InstanceID  string
+	Address     string
+	Port        int
+	HealthCheck HealthCheck
+	Status      string
+	Generation  uint64
+}
+
+// ApplyProbeObservations accepts results only if the probed endpoint and policy still match.
+func (s *Store) ApplyProbeObservations(observations []ProbeObservation) error {
+	if len(observations) == 0 {
+		return nil
+	}
+	latest := make(map[string]ProbeObservation, len(observations))
+	for _, observation := range observations {
+		latest[observation.InstanceID] = observation
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := clone(s.data)
+	changed := false
+	for i := range next.Services {
+		service := &next.Services[i]
+		for j := range service.Instances {
+			instance := &service.Instances[j]
+			observation, ok := latest[instance.ID]
+			if !ok || !instance.Enabled || instance.ProbeGeneration != observation.Generation || instance.Address != observation.Address || instance.Port != observation.Port || service.HealthCheck != observation.HealthCheck {
+				continue
+			}
+			if (observation.Status == HealthHealthy || observation.Status == HealthUnhealthy) && instance.Health != observation.Status {
+				instance.Health = observation.Status
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	next.Version++
+	if err := s.commit(next); err != nil {
 		return err
 	}
 	s.data = next
@@ -285,6 +236,7 @@ func (s *Store) SaveService(id string, item Service) (Service, error) {
 				if item.HealthCheck != d.Services[i].HealthCheck {
 					for j := range item.Instances {
 						item.Instances[j].Health = HealthUnknown
+						item.Instances[j].ProbeGeneration++
 					}
 				}
 				d.Services[i] = item
@@ -338,6 +290,7 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 		}
 		if id == "" {
 			item.ID = newID()
+			item.ProbeGeneration = 1
 			d.Services[serviceIndex].Instances = append(d.Services[serviceIndex].Instances, item)
 			return nil
 		}
@@ -347,6 +300,7 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 					return bad("managed_instance")
 				}
 				item.ID = id
+				item.ProbeGeneration = d.Services[serviceIndex].Instances[i].ProbeGeneration + 1
 				d.Services[serviceIndex].Instances[i] = item
 				return nil
 			}

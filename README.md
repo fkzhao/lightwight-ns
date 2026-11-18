@@ -7,7 +7,7 @@ A small service registry for microservices. The registry center owns service def
 ```text
 Service process ── registration SDK ── HTTP/JSON ── Registry center
                                                     │
-                                        health checks and JSON snapshot
+                                        health checks and SQLite WAL
                                                     │
 Service process ── discovery SDK ── local Agent ── Go RPC snapshot sync
                          TCP or Unix socket
@@ -21,7 +21,7 @@ The center remains the source of truth. The agent's TCP and Unix listeners use n
 | --- | --- |
 | `core/registry-center/` | Center process: management and registration HTTP API, center RPC listener, health checker, and built Web UI. |
 | `core/agent/` | Local agent process: center sync, cache, Unix socket listener, and TCP listener. |
-| `core/internal/registry/` | Service and instance model, validation, JSON persistence, leases, and center RPC. |
+| `core/internal/registry/` | Service and instance model, validation, SQLite WAL persistence, memory cache, leases, JSON migration, and center RPC. |
 | `core/internal/health/` | TCP or HTTP health probes and lease expiry. |
 | `core/internal/agent/` | Cached snapshot, healthy endpoint filtering, and JSON-RPC protocol. |
 | `sdk/go/discovery/` and `sdk/go/registration/` | Go SDKs for agent lookup and center registration. |
@@ -36,7 +36,7 @@ Services are created in the Web UI or management API with a name and a TCP or HT
 
 ## Run locally
 
-Requires Go 1.22 or newer. The Web development build also requires Node.js 22.13 or newer. Python SDK requires Python 3.9 or newer; Java SDK requires Java 17 and Maven.
+Requires Go 1.25 or newer. SQLite is embedded through a Go driver, so no database server or C toolchain is required. The Web development build also requires Node.js 22.13 or newer. Python SDK requires Python 3.9 or newer; Java SDK requires Java 17 and Maven.
 
 From the repository root, start the center and agent in separate terminals:
 
@@ -58,6 +58,16 @@ npm run dev
 ```
 
 Vite proxies `/api` to the center. To serve the Web UI directly from the center, run `npm run build` in `web/`, then start the center from the repository root.
+
+## Storage and health scheduling
+
+The center stores services, instances, and registration leases in `data/registry.db`, with SQLite WAL enabled and `synchronous=FULL`. A lease renewal updates only its instance row and does not change the discovery revision. Discovery and snapshot reads use the in-memory registry. Health results stay in memory; a restart resets them to Checking until a fresh probe succeeds. Changes are published to readers only after their SQL transaction commits.
+
+On first startup, a new database automatically imports the JSON file with the same directory and base name: `data/registry.json` becomes `data/registry.db`. Both the nested instance format and the older machines/instances format are supported. The JSON file is preserved and never imported again after a successful migration. Invalid JSON stops startup; fix the input and restart to retry. Existing `NS_DATA_FILE=/path/registry.json` configuration still works and selects `/path/registry.db`. Set `NS_DB_FILE` for new deployments.
+
+Health probes use 128 workers by default, with at most one active probe per instance. Each instance is scheduled again after its previous check completes plus `NS_HEALTH_INTERVAL`. Results are published in batches of up to 64 or every 200 ms, independently of slow probes. Lease expiry is checked at least once per second under normal load. Configure concurrency and timeout for the number of instances and network latency. For example, 1000 probes that all consume the 2-second timeout need roughly 16 seconds of worker time at concurrency 128, so a 5-second interval is not a guarantee that every instance is checked within 5 seconds during an outage.
+
+Run one center process per database on a local disk. SQLite WAL files are not a shared database for multiple center nodes or network filesystems. For a simple backup, stop the center and copy its data directory; retain any `-wal` file present with the database. Never delete WAL files from a running database. See [SQLite WAL documentation](https://www.sqlite.org/wal.html).
 
 ## SDK usage
 
@@ -148,6 +158,8 @@ npm run build --prefix web
 python3 tests/e2e.py
 ```
 
+The Go tests include migration/restart recovery, concurrent renewals for 100 services and 1000 instances, and health scheduling across 1000 endpoints. Run the isolated storage benchmark with `go test ./core/internal/registry -run '^$' -bench BenchmarkLeaseRenewal1000Instances -benchtime=2000x -benchmem`. These tests use temporary databases and do not change the running center's data. Benchmark results depend on disk latency and do not establish a production capacity guarantee.
+
 ## Center APIs
 
 | Method | Path | Purpose |
@@ -168,14 +180,17 @@ The service input includes `name`, `description`, and `healthCheck`, such as `{"
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `NS_DATA_FILE` | `data/registry.json` | Center JSON snapshot file |
+| `NS_DB_FILE` | `data/registry.db` | Center SQLite database; takes precedence over `NS_DATA_FILE` |
+| `NS_DATA_FILE` | unset | Legacy path setting; a `.json` suffix selects the sibling `.db` database |
 | `NS_HTTP_ADDR` | `127.0.0.1:8080` | Center HTTP address |
 | `NS_RPC_ADDR` | `127.0.0.1:9090` | Center-to-agent sync address |
-| `NS_HEALTH_INTERVAL` | `5s` | Health-check and lease-expiry interval |
+| `NS_HEALTH_INTERVAL` | `5s` | Delay between completed checks of each instance |
+| `NS_HEALTH_TIMEOUT` | `2s` | Maximum duration of one TCP or HTTP probe |
+| `NS_HEALTH_CONCURRENCY` | `128` | Maximum simultaneous probes, from 1 to 4096 |
 | `NS_WEB_DIST` | `web/dist` | Built frontend directory |
 | `NS_CENTER_RPC_ADDR` | `127.0.0.1:9090` | Center address used by an agent |
 | `NS_AGENT_SOCKET` | `/tmp/lightwight-ns/agent.sock` | Local agent Unix socket |
 | `NS_AGENT_TCP_ADDR` | `127.0.0.1:9091` | Local agent TCP address |
 | `NS_SYNC_INTERVAL` | `5s` | Agent sync interval |
 
-The center uses a single JSON file and does not yet replicate data across nodes. Center HTTP and RPC and agent TCP have no built-in authentication or TLS. Keep them on trusted networks; the agent TCP listener binds to loopback by default. The agent keeps its last synchronized snapshot during a center outage, so health changes become visible after connectivity returns.
+The center uses a single SQLite database and does not replicate data across nodes. Center HTTP and RPC and agent TCP have no built-in authentication or TLS. Keep them on trusted networks; the agent TCP listener binds to loopback by default. The agent keeps its last synchronized snapshot during a center outage, so health changes become visible after connectivity returns.

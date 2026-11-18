@@ -11,7 +11,7 @@ import (
 )
 
 func TestSyncAndLocalDiscoveryTracksHealth(t *testing.T) {
-	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.json"))
+	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

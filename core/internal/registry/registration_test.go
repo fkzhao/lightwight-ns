@@ -9,7 +9,7 @@ import (
 )
 
 func TestRegistrationLeaseLifecycle(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "registry.json"))
+	store, err := NewStore(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,12 +26,23 @@ func TestRegistrationLeaseLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	registeredVersion := store.Snapshot().Version
+	var beforeChanges int64
+	if err := store.db.QueryRow("SELECT total_changes()").Scan(&beforeChanges); err != nil {
+		t.Fatal(err)
+	}
 	second, err := store.RegisterInstance(input)
 	if err != nil || second.InstanceID != first.InstanceID {
 		t.Fatalf("registration retry was not idempotent: %+v, %v", second, err)
 	}
 	if store.Snapshot().Version != registeredVersion {
 		t.Fatal("lease renewal should not trigger a new agent snapshot")
+	}
+	var afterChanges int64
+	if err := store.db.QueryRow("SELECT total_changes()").Scan(&afterChanges); err != nil {
+		t.Fatal(err)
+	}
+	if afterChanges-beforeChanges > 1 {
+		t.Fatalf("lease renewal changed %d SQL rows, expected at most one", afterChanges-beforeChanges)
 	}
 	if _, err := store.RenewRegistration(first.InstanceID, strings.Repeat("b", 64)); err == nil {
 		t.Fatal("wrong token renewed a registration")
@@ -70,7 +81,7 @@ func TestRegistrationLeaseLifecycle(t *testing.T) {
 }
 
 func TestExpiredRegistrationNeedsFreshHealthCheck(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "registry.json"))
+	store, err := NewStore(filepath.Join(t.TempDir(), "registry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +94,7 @@ func TestExpiredRegistrationNeedsFreshHealthCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
+	oldGeneration := store.data.Services[0].Instances[0].ProbeGeneration
 	store.data.Services[0].Instances[0].Health = HealthHealthy
 	store.data.Services[0].Instances[0].LeaseExpiresAt = time.Now().Add(-time.Second).Unix()
 	version := store.data.Version
@@ -94,5 +106,14 @@ func TestExpiredRegistrationNeedsFreshHealthCheck(t *testing.T) {
 	snapshot := store.Snapshot()
 	if snapshot.Services[0].Instances[0].Health != HealthUnknown || snapshot.Version != version+1 {
 		t.Fatalf("expired registration was not removed from discovery until rechecked: %+v", snapshot)
+	}
+	if err := store.ApplyProbeObservations([]ProbeObservation{{
+		InstanceID: registered.InstanceID, Address: input.Address, Port: input.Port,
+		HealthCheck: HealthCheck{Type: "tcp"}, Status: HealthHealthy, Generation: oldGeneration,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if store.Snapshot().Services[0].Instances[0].Health != HealthUnknown {
+		t.Fatal("a probe from the expired lease made its renewed registration available")
 	}
 }

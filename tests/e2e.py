@@ -66,7 +66,7 @@ def main():
         http_port, rpc_port, agent_port, service_port = [free_port() for _ in range(4)]
         socket_path = temp / "agent.sock"
         base = "http://127.0.0.1:{}".format(http_port)
-        center_env = {**os.environ, "NS_DATA_FILE": str(temp / "registry.json"),
+        center_env = {**os.environ, "NS_DB_FILE": str(temp / "registry.db"),
                       "NS_HTTP_ADDR": "127.0.0.1:{}".format(http_port),
                       "NS_RPC_ADDR": "127.0.0.1:{}".format(rpc_port),
                       "NS_HEALTH_INTERVAL": "200ms", "NS_WEB_DIST": str(temp / "missing")}
@@ -105,7 +105,19 @@ def main():
                     listener.listen()
                     wait_for(lambda: len(client.resolve("e2e-orders")) == 1)
                 wait_for(lambda: client.resolve("e2e-orders") == [])
-            print("center, agent, lease, health removal/recovery, and Go/Python discovery: OK")
+            service_id = request(base + "/api/snapshot")["services"][0]["id"]
+            request(base + "/api/services/" + service_id + "/instances",
+                    {"address": "127.0.0.1", "port": service_port, "enabled": True})
+            center.kill()
+            center.wait(timeout=3)
+            center = subprocess.Popen([str(binaries["center"])], env=center_env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            wait_for(lambda: request(base + "/api/health")["status"] == "ok")
+            restored = request(base + "/api/snapshot")["services"][0]
+            assert restored["id"] == service_id and len(restored["instances"]) == 1
+            with DiscoveryClient(("127.0.0.1", agent_port)) as client:
+                wait_for(lambda: len(client.resolve("e2e-orders")) == 1)
+            print("center, agent, lease, health removal/recovery, Go/Python discovery, and SQLite crash recovery: OK")
         finally:
             if listener is not None:
                 listener.close()
