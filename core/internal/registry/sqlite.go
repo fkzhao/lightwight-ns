@@ -2,12 +2,14 @@ package registry
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -51,6 +53,10 @@ func NewStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	snapshot, err := loadSQLiteSnapshot(db)
 	if err != nil {
 		db.Close()
@@ -62,7 +68,7 @@ func NewStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, data: snapshot}, nil
+	return &Store{db: db, data: snapshot, changed: make(chan struct{}), startedAt: time.Now(), beats: make(map[string]time.Time), protections: make(map[string]ProtectionStatus)}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -90,6 +96,7 @@ func configureSQLite(db *sql.DB) error {
 func initializeSQLite(db *sql.DB, path string) error {
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS retired_registrations (token_hash TEXT PRIMARY KEY)`,
 		`CREATE TABLE IF NOT EXISTS services (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
 			description TEXT NOT NULL, health_type TEXT NOT NULL, health_path TEXT NOT NULL
@@ -147,16 +154,37 @@ func loadSQLiteSnapshot(db *sql.DB) (Snapshot, error) {
 	if err := db.QueryRow("SELECT value FROM metadata WHERE key = 'version'").Scan(&snapshot.Version); err != nil {
 		return Snapshot{}, err
 	}
-	rows, err := db.Query("SELECT id, name, description, health_type, health_path FROM services ORDER BY rowid")
+	rows, err := db.Query("SELECT id, name, description, health_type, health_path, namespace, service_group, config_json FROM services ORDER BY rowid")
 	if err != nil {
 		return Snapshot{}, err
 	}
 	byID := make(map[string]int)
 	for rows.Next() {
 		service := Service{Instances: []Instance{}}
-		if err := rows.Scan(&service.ID, &service.Name, &service.Description, &service.HealthCheck.Type, &service.HealthCheck.Path); err != nil {
+		var config string
+		if err := rows.Scan(&service.ID, &service.Name, &service.Description, &service.HealthCheck.Type, &service.HealthCheck.Path, &service.Namespace, &service.Group, &config); err != nil {
 			rows.Close()
 			return Snapshot{}, err
+		}
+		if config != "{}" {
+			var parsed serviceConfig
+			if err := json.Unmarshal([]byte(config), &parsed); err != nil {
+				rows.Close()
+				return Snapshot{}, err
+			}
+			service.HealthCheck = parsed.HealthCheck
+			service.Protection = parsed.Protection
+		}
+		var policyErr error
+		service.HealthCheck, policyErr = normalizeHealthCheck(service.HealthCheck)
+		if policyErr != nil {
+			rows.Close()
+			return Snapshot{}, fmt.Errorf("service %s health policy: %w", service.ID, policyErr)
+		}
+		service.Protection, policyErr = normalizeProtection(service.Protection)
+		if policyErr != nil {
+			rows.Close()
+			return Snapshot{}, fmt.Errorf("service %s protection policy: %w", service.ID, policyErr)
 		}
 		byID[service.ID] = len(snapshot.Services)
 		snapshot.Services = append(snapshot.Services, service)
@@ -166,16 +194,27 @@ func loadSQLiteSnapshot(db *sql.DB) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	rows.Close()
-	rows, err = db.Query("SELECT id, service_id, address, port, enabled, source, token_hash, lease_expires_at FROM instances ORDER BY rowid")
+	rows, err = db.Query("SELECT id, service_id, address, port, enabled, source, token_hash, lease_expires_at, config_json FROM instances ORDER BY rowid")
 	if err != nil {
 		return Snapshot{}, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var instance Instance
-		var serviceID string
+		var serviceID, config string
 		var enabled int
-		if err := rows.Scan(&instance.ID, &serviceID, &instance.Address, &instance.Port, &enabled, &instance.Source, &instance.LeaseTokenHash, &instance.LeaseExpiresAt); err != nil {
+		if err := rows.Scan(&instance.ID, &serviceID, &instance.Address, &instance.Port, &enabled, &instance.Source, &instance.LeaseTokenHash, &instance.LeaseExpiresAt, &config); err != nil {
+			return Snapshot{}, err
+		}
+		var parsed instanceConfig
+		if err := json.Unmarshal([]byte(config), &parsed); err != nil {
+			return Snapshot{}, err
+		}
+		instance.Version = parsed.Version
+		instance.Weight = parsed.Weight
+		instance.Metadata = parsed.Metadata
+		instance.Lifecycle = parsed.Lifecycle
+		if err := normalizeInstance(&instance); err != nil {
 			return Snapshot{}, err
 		}
 		instance.Enabled = enabled != 0
@@ -197,7 +236,9 @@ type persistedInstance struct {
 
 // commit writes only changed rows, then publishes the new in-memory snapshot.
 // The caller holds s.mu and assigns s.data only after commit succeeds.
-func (s *Store) commit(next Snapshot) error {
+func (s *Store) commit(next Snapshot) error { return s.commitWithRetired(next, false) }
+
+func (s *Store) commitWithRetired(next Snapshot, retireRemoved bool) error {
 	oldServices := make(map[string]Service, len(s.data.Services))
 	newServices := make(map[string]Service, len(next.Services))
 	oldInstances := make(map[string]persistedInstance)
@@ -221,6 +262,12 @@ func (s *Store) commit(next Snapshot) error {
 	defer tx.Rollback()
 	for id := range oldInstances {
 		if _, ok := newInstances[id]; !ok {
+			old := oldInstances[id]
+			if old.Source == "sdk" && (retireRemoved || old.Lifecycle == "draining") {
+				if _, err := tx.Exec("INSERT OR IGNORE INTO retired_registrations (token_hash) VALUES (?)", old.LeaseTokenHash); err != nil {
+					return err
+				}
+			}
 			if _, err := tx.Exec("DELETE FROM instances WHERE id = ?", id); err != nil {
 				return err
 			}
@@ -236,22 +283,22 @@ func (s *Store) commit(next Snapshot) error {
 	for _, service := range next.Services {
 		old, exists := oldServices[service.ID]
 		if !exists {
-			if _, err := tx.Exec("INSERT INTO services (id, name, description, health_type, health_path) VALUES (?, ?, ?, ?, ?)", service.ID, service.Name, service.Description, service.HealthCheck.Type, service.HealthCheck.Path); err != nil {
+			if _, err := tx.Exec("INSERT INTO services (id, name, description, health_type, health_path, namespace, service_group, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", service.ID, service.Name, service.Description, service.HealthCheck.Type, service.HealthCheck.Path, scope(service.Namespace), scope(service.Group), serviceJSON(service)); err != nil {
 				return err
 			}
-		} else if old.Name != service.Name || old.Description != service.Description || old.HealthCheck != service.HealthCheck {
-			if _, err := tx.Exec("UPDATE services SET name = ?, description = ?, health_type = ?, health_path = ? WHERE id = ?", service.Name, service.Description, service.HealthCheck.Type, service.HealthCheck.Path, service.ID); err != nil {
+		} else if old.Name != service.Name || old.Description != service.Description || old.HealthCheck != service.HealthCheck || old.Namespace != service.Namespace || old.Group != service.Group || old.Protection != service.Protection {
+			if _, err := tx.Exec("UPDATE services SET name = ?, description = ?, health_type = ?, health_path = ?, namespace = ?, service_group = ?, config_json = ? WHERE id = ?", service.Name, service.Description, service.HealthCheck.Type, service.HealthCheck.Path, scope(service.Namespace), scope(service.Group), serviceJSON(service), service.ID); err != nil {
 				return err
 			}
 		}
 		for _, instance := range service.Instances {
 			old, exists := oldInstances[instance.ID]
 			if !exists {
-				if _, err := tx.Exec("INSERT INTO instances (id, service_id, address, port, enabled, source, token_hash, lease_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", instance.ID, service.ID, instance.Address, instance.Port, instance.Enabled, instance.Source, instance.LeaseTokenHash, instance.LeaseExpiresAt); err != nil {
+				if _, err := tx.Exec("INSERT INTO instances (id, service_id, address, port, enabled, source, token_hash, lease_expires_at, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", instance.ID, service.ID, instance.Address, instance.Port, instance.Enabled, instance.Source, instance.LeaseTokenHash, instance.LeaseExpiresAt, instanceJSON(instance)); err != nil {
 					return err
 				}
-			} else if old.ServiceID != service.ID || old.Address != instance.Address || old.Port != instance.Port || old.Enabled != instance.Enabled || old.Source != instance.Source || old.LeaseTokenHash != instance.LeaseTokenHash {
-				if _, err := tx.Exec("UPDATE instances SET service_id = ?, address = ?, port = ?, enabled = ?, source = ?, token_hash = ?, lease_expires_at = ? WHERE id = ?", service.ID, instance.Address, instance.Port, instance.Enabled, instance.Source, instance.LeaseTokenHash, instance.LeaseExpiresAt, instance.ID); err != nil {
+			} else if old.ServiceID != service.ID || old.Address != instance.Address || old.Port != instance.Port || old.Enabled != instance.Enabled || old.Source != instance.Source || old.LeaseTokenHash != instance.LeaseTokenHash || instanceJSON(old.Instance) != instanceJSON(instance) {
+				if _, err := tx.Exec("UPDATE instances SET service_id = ?, address = ?, port = ?, enabled = ?, source = ?, token_hash = ?, lease_expires_at = ?, config_json = ? WHERE id = ?", service.ID, instance.Address, instance.Port, instance.Enabled, instance.Source, instance.LeaseTokenHash, instance.LeaseExpiresAt, instanceJSON(instance), instance.ID); err != nil {
 					return err
 				}
 			} else if old.LeaseExpiresAt != instance.LeaseExpiresAt {

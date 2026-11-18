@@ -15,6 +15,7 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class SdkTest {
@@ -30,6 +31,9 @@ class SdkTest {
                         String result = request.get("method").getAsString().equals("agent.status")
                                 ? "{\"ready\":true,\"registryVersion\":7,\"lastSyncAt\":\"now\"}"
                                 : "{\"registryVersion\":7,\"endpoints\":[{\"address\":\"127.0.0.1\",\"port\":8081}]}";
+                        if (request.get("method").getAsString().equals("discovery.resolveV2")) {
+                            result = "{\"registryVersion\":7,\"stale\":false,\"endpoints\":[{\"instanceId\":\"one\",\"address\":\"127.0.0.1\",\"port\":8081,\"weight\":25,\"version\":\"v2\"}]}";
+                        }
                         writer.write("{\"jsonrpc\":\"2.0\",\"id\":" + request.get("id") + ",\"result\":" + result + "}\n");
                         writer.flush();
                     }
@@ -39,6 +43,9 @@ class SdkTest {
             try (DiscoveryClient client = new DiscoveryClient("127.0.0.1", server.getLocalPort())) {
                 assertEquals(List.of(new Endpoint("127.0.0.1", 8081)), client.resolve("orders"));
                 assertTrue(client.agentStatus().ready());
+                var detailed = client.resolveV2(new ResolveQuery("orders", "prod", "blue", "v2", Map.of(), false));
+                assertEquals(25, detailed.pickWeighted().weight());
+                assertEquals("v2", detailed.endpoints().get(0).version());
             }
             worker.join(3000);
         }
@@ -60,10 +67,11 @@ class SdkTest {
         server.start();
         try {
             RegistrationClient client = new RegistrationClient("http://127.0.0.1:" + server.getAddress().getPort());
-            try (var lease = client.register("orders", "127.0.0.1", 8081)) {
+            try (var lease = client.register("orders", "127.0.0.1", 8081, new RegistrationOptions("prod", "blue", "v2", 25, Map.of("zone", "a")))) {
                 assertEquals("instance-1", lease.instanceId());
+                lease.drain();
             }
-            assertEquals(List.of("POST", "DELETE"), methods);
+            assertEquals(List.of("POST", "POST", "DELETE"), methods);
             assertEquals(tokens.get(0), tokens.get(1));
         } finally { server.stop(0); }
     }

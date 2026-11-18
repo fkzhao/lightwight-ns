@@ -14,6 +14,7 @@ interface RegistryContextValue {
   saveService: (value: ServiceInput, id?: string) => Promise<Service | null>
   removeService: (id: string) => Promise<boolean>
   saveInstance: (serviceId: string, value: InstanceInput, id?: string) => Promise<boolean>
+  setInstanceState: (serviceId: string, id: string, action: "drain" | "enabled", enabled?: boolean) => Promise<boolean>
   removeInstance: (serviceId: string, id: string) => Promise<boolean>
 }
 
@@ -112,8 +113,17 @@ export function RegistryProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  const setInstanceState = async (serviceId: string, id: string, action: "drain" | "enabled", enabled?: boolean) => {
+    try {
+      await api.setInstanceState(serviceId, id, action, enabled)
+      await refresh()
+      toast.success(t("common.saved"))
+      return true
+    } catch (cause) { toast.error(message(cause)); return false }
+  }
+
   return (
-    <RegistryContext.Provider value={{ snapshot, loading, error, refresh, saveService, removeService, saveInstance, removeInstance }}>
+    <RegistryContext.Provider value={{ snapshot, loading, error, refresh, saveService, removeService, saveInstance, removeInstance, setInstanceState }}>
       {children}
     </RegistryContext.Provider>
   )

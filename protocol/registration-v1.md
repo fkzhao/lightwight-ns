@@ -23,3 +23,5 @@ The token is a random 256-bit secret generated once per lease. Repeating the sam
 `POST /api/registrations/{instanceId}/renew` with `{"token":"..."}` extends a current lease. The SDKs use idempotent registration instead because it also recovers an expired lease. `DELETE /api/registrations/{instanceId}` with the same token deregisters the instance on graceful shutdown.
 
 The center stores only a SHA-256 hash of the token, not the token itself. A different token cannot renew or delete the lease. The management API and registration API currently have no authentication or TLS; deploy the center on a trusted network or behind an authenticated gateway. This repository does not yet implement automatic leader election or replicated storage.
+
+Additional scoped metadata, draining, retired-token behavior, and self protection are documented in [the v2 extensions](discovery-v2.md).

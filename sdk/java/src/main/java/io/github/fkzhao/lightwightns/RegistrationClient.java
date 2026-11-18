@@ -1,6 +1,7 @@
 package io.github.fkzhao.lightwightns;
 
 import com.google.gson.JsonObject;
+import com.google.gson.Gson;
 import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.net.URI;
@@ -41,11 +42,15 @@ public final class RegistrationClient {
     }
 
     public RegistrationLease register(String serviceName, String address, int port) throws IOException, InterruptedException {
+        return register(serviceName,address,port,new RegistrationOptions());
+    }
+
+    public RegistrationLease register(String serviceName, String address, int port, RegistrationOptions options) throws IOException, InterruptedException {
         byte[] secret = new byte[32];
         new SecureRandom().nextBytes(secret);
         StringBuilder token = new StringBuilder(64);
         for (byte value : secret) token.append(String.format("%02x", value & 0xff));
-        JsonObject body = new JsonObject();
+        JsonObject body = new Gson().toJsonTree(options).getAsJsonObject();
         body.addProperty("serviceName", serviceName);
         body.addProperty("address", address);
         body.addProperty("port", port);
@@ -85,6 +90,12 @@ public final class RegistrationClient {
         public String instanceId() { return instanceId; }
         public Exception lastRenewalError() { return lastRenewalError; }
 
+        public void drain() throws IOException, InterruptedException {
+            JsonObject token = new JsonObject();
+            token.addProperty("token", body.get("token").getAsString());
+            request("POST", "/api/registrations/" + instanceId + "/drain", token);
+        }
+
         @Override public synchronized void close() throws IOException, InterruptedException {
             if (closed) return;
             scheduler.shutdown();
@@ -93,7 +104,8 @@ public final class RegistrationClient {
             }
             JsonObject token = new JsonObject();
             token.addProperty("token", body.get("token").getAsString());
-            request("DELETE", "/api/registrations/" + instanceId, token);
+            try { request("DELETE", "/api/registrations/" + instanceId, token); }
+            catch (RegistrationException error) { if (error.status() != 404) throw error; }
             closed = true;
         }
     }

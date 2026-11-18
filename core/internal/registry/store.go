@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"maps"
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -16,28 +18,51 @@ const (
 )
 
 type HealthCheck struct {
-	Type string `json:"type"`
-	Path string `json:"path"`
+	Type             string `json:"type"`
+	Path             string `json:"path"`
+	FailureThreshold int    `json:"failureThreshold"`
+	SuccessThreshold int    `json:"successThreshold"`
+	IntervalMillis   int    `json:"intervalMillis,omitempty"`
+	TimeoutMillis    int    `json:"timeoutMillis,omitempty"`
+	GRPCService      string `json:"grpcService,omitempty"`
+	TLS              bool   `json:"tls,omitempty"`
+	ServerName       string `json:"serverName,omitempty"`
+	CAPEM            string `json:"caPem,omitempty"`
 }
 
 type Instance struct {
-	ID              string `json:"id"`
-	Address         string `json:"address"`
-	Port            int    `json:"port"`
-	Enabled         bool   `json:"enabled"`
-	Health          string `json:"health"`
-	Source          string `json:"source,omitempty"`
-	LeaseTokenHash  string `json:"leaseTokenHash,omitempty"`
-	LeaseExpiresAt  int64  `json:"leaseExpiresAt,omitempty"`
-	ProbeGeneration uint64 `json:"-"`
+	ID                   string            `json:"id"`
+	Address              string            `json:"address"`
+	Port                 int               `json:"port"`
+	Enabled              bool              `json:"enabled"`
+	Health               string            `json:"health"`
+	Source               string            `json:"source,omitempty"`
+	LeaseTokenHash       string            `json:"leaseTokenHash,omitempty"`
+	LeaseExpiresAt       int64             `json:"leaseExpiresAt,omitempty"`
+	ProbeGeneration      uint64            `json:"-"`
+	Version              string            `json:"version,omitempty"`
+	Weight               *int              `json:"weight,omitempty"`
+	Metadata             map[string]string `json:"metadata,omitempty"`
+	Lifecycle            string            `json:"lifecycle"`
+	LeaseExpired         bool              `json:"leaseExpired,omitempty"`
+	LastCheckAt          int64             `json:"lastCheckAt,omitempty"`
+	LastHealthyAt        int64             `json:"lastHealthyAt,omitempty"`
+	LastError            string            `json:"lastError,omitempty"`
+	DurationMillis       int64             `json:"durationMillis,omitempty"`
+	ConsecutiveFailures  int               `json:"consecutiveFailures"`
+	ConsecutiveSuccesses int               `json:"consecutiveSuccesses"`
 }
 
 type Service struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	HealthCheck HealthCheck `json:"healthCheck"`
-	Instances   []Instance  `json:"instances"`
+	ID               string           `json:"id"`
+	Namespace        string           `json:"namespace"`
+	Group            string           `json:"group"`
+	Protection       ProtectionPolicy `json:"protection"`
+	ProtectionStatus ProtectionStatus `json:"protectionStatus"`
+	Name             string           `json:"name"`
+	Description      string           `json:"description"`
+	HealthCheck      HealthCheck      `json:"healthCheck"`
+	Instances        []Instance       `json:"instances"`
 }
 
 type Snapshot struct {
@@ -51,9 +76,13 @@ func (e DomainError) Error() string { return e.Code }
 func bad(code string) error         { return DomainError{Code: code} }
 
 type Store struct {
-	mu   sync.RWMutex
-	db   *sql.DB
-	data Snapshot
+	mu          sync.RWMutex
+	db          *sql.DB
+	data        Snapshot
+	changed     chan struct{}
+	startedAt   time.Time
+	beats       map[string]time.Time
+	protections map[string]ProtectionStatus
 }
 
 func clone(src Snapshot) Snapshot {
@@ -61,6 +90,14 @@ func clone(src Snapshot) Snapshot {
 	for i, service := range src.Services {
 		services[i] = service
 		services[i].Instances = append([]Instance{}, service.Instances...)
+		for j := range services[i].Instances {
+			instance := &services[i].Instances[j]
+			instance.Metadata = maps.Clone(instance.Metadata)
+			if instance.Weight != nil {
+				weight := *instance.Weight
+				instance.Weight = &weight
+			}
+		}
 	}
 	src.Services = services
 	return src
@@ -83,7 +120,9 @@ func (s *Store) SnapshotSince(version uint64) (Snapshot, bool) {
 }
 
 // Update persists a new snapshot before exposing it to concurrent readers.
-func (s *Store) Update(change func(*Snapshot) error) error {
+func (s *Store) Update(change func(*Snapshot) error) error { return s.update(change, false) }
+
+func (s *Store) update(change func(*Snapshot) error, retireRemoved bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := clone(s.data)
@@ -91,10 +130,10 @@ func (s *Store) Update(change func(*Snapshot) error) error {
 		return err
 	}
 	next.Version++
-	if err := s.commit(next); err != nil {
+	if err := s.commitWithRetired(next, retireRemoved); err != nil {
 		return err
 	}
-	s.data = next
+	s.publish(next)
 	return nil
 }
 
@@ -124,17 +163,20 @@ func (s *Store) ApplyHealth(observedVersion uint64, results map[string]string) e
 	if err := s.commit(next); err != nil {
 		return err
 	}
-	s.data = next
+	s.publish(next)
 	return nil
 }
 
 type ProbeObservation struct {
-	InstanceID  string
-	Address     string
-	Port        int
-	HealthCheck HealthCheck
-	Status      string
-	Generation  uint64
+	InstanceID     string
+	Address        string
+	Port           int
+	HealthCheck    HealthCheck
+	Status         string
+	Generation     uint64
+	Error          string
+	DurationMillis int64
+	CheckedAt      int64
 }
 
 // ApplyProbeObservations accepts results only if the probed endpoint and policy still match.
@@ -142,36 +184,55 @@ func (s *Store) ApplyProbeObservations(observations []ProbeObservation) error {
 	if len(observations) == 0 {
 		return nil
 	}
-	latest := make(map[string]ProbeObservation, len(observations))
-	for _, observation := range observations {
-		latest[observation.InstanceID] = observation
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := clone(s.data)
 	changed := false
-	for i := range next.Services {
-		service := &next.Services[i]
-		for j := range service.Instances {
-			instance := &service.Instances[j]
-			observation, ok := latest[instance.ID]
-			if !ok || !instance.Enabled || instance.ProbeGeneration != observation.Generation || instance.Address != observation.Address || instance.Port != observation.Port || service.HealthCheck != observation.HealthCheck {
-				continue
-			}
-			if (observation.Status == HealthHealthy || observation.Status == HealthUnhealthy) && instance.Health != observation.Status {
-				instance.Health = observation.Status
-				changed = true
+	for _, observation := range observations {
+		for i := range next.Services {
+			service := &next.Services[i]
+			for j := range service.Instances {
+				instance := &service.Instances[j]
+				if instance.ID != observation.InstanceID || !instance.Enabled || instance.ProbeGeneration != observation.Generation || instance.Address != observation.Address || instance.Port != observation.Port || service.HealthCheck != observation.HealthCheck {
+					continue
+				}
+				if observation.Status != HealthHealthy && observation.Status != HealthUnhealthy {
+					continue
+				}
+				instance.LastCheckAt = observation.CheckedAt
+				if instance.LastCheckAt == 0 {
+					instance.LastCheckAt = time.Now().UnixMilli()
+				}
+				instance.LastError = observation.Error
+				instance.DurationMillis = observation.DurationMillis
+				previous := instance.Health
+				if observation.Status == HealthHealthy {
+					instance.ConsecutiveFailures = 0
+					instance.ConsecutiveSuccesses++
+					instance.LastHealthyAt = instance.LastCheckAt
+					if instance.ConsecutiveSuccesses >= max(1, service.HealthCheck.SuccessThreshold) {
+						instance.Health = HealthHealthy
+					}
+				} else {
+					instance.ConsecutiveSuccesses = 0
+					instance.ConsecutiveFailures++
+					if instance.ConsecutiveFailures >= max(1, service.HealthCheck.FailureThreshold) {
+						instance.Health = HealthUnhealthy
+					}
+				}
+				changed = changed || previous != instance.Health
 			}
 		}
 	}
-	if !changed {
-		return nil
+	if changed {
+		next.Version++
+		if err := s.commit(next); err != nil {
+			return err
+		}
+		s.publish(next)
+	} else {
+		s.data = next
 	}
-	next.Version++
-	if err := s.commit(next); err != nil {
-		return err
-	}
-	s.data = next
 	return nil
 }
 
@@ -187,10 +248,19 @@ func normalizeHealthCheck(check HealthCheck) (HealthCheck, error) {
 	if check.Type == "" {
 		check.Type = "tcp"
 	}
-	if check.Type != "tcp" && check.Type != "http" {
+	if check.FailureThreshold == 0 {
+		check.FailureThreshold = 3
+	}
+	if check.SuccessThreshold == 0 {
+		check.SuccessThreshold = 2
+	}
+	if check.FailureThreshold < 1 || check.FailureThreshold > 20 || check.SuccessThreshold < 1 || check.SuccessThreshold > 20 || check.IntervalMillis < 0 || check.IntervalMillis > 3600000 || check.TimeoutMillis < 0 || check.TimeoutMillis > 60000 || (len(check.GRPCService) > 200 || len(check.ServerName) > 200) || len(check.CAPEM) > 65536 {
+		return HealthCheck{}, bad("invalid_health_policy")
+	}
+	if check.Type != "tcp" && check.Type != "http" && check.Type != "grpc" {
 		return HealthCheck{}, bad("invalid_health_type")
 	}
-	if check.Type == "tcp" {
+	if check.Type != "http" {
 		check.Path = ""
 		return check, nil
 	}
@@ -216,10 +286,20 @@ func (s *Store) SaveService(id string, item Service) (Service, error) {
 	if err != nil {
 		return Service{}, err
 	}
+	item.ProtectionStatus = ProtectionStatus{}
 	item.HealthCheck = check
+	item.Namespace = scope(item.Namespace)
+	item.Group = scope(item.Group)
+	if !validLabel(item.Namespace) || !validLabel(item.Group) {
+		return Service{}, bad("invalid_scope")
+	}
+	item.Protection, err = normalizeProtection(item.Protection)
+	if err != nil {
+		return Service{}, err
+	}
 	err = s.Update(func(d *Snapshot) error {
 		for _, existing := range d.Services {
-			if existing.ID != id && strings.EqualFold(existing.Name, item.Name) {
+			if existing.ID != id && strings.EqualFold(existing.Name, item.Name) && strings.EqualFold(scope(existing.Namespace), item.Namespace) && strings.EqualFold(scope(existing.Group), item.Group) {
 				return bad("duplicate_service_name")
 			}
 		}
@@ -227,19 +307,29 @@ func (s *Store) SaveService(id string, item Service) (Service, error) {
 			item.ID = newID()
 			item.Instances = []Instance{}
 			d.Services = append(d.Services, item)
+			item = clone(Snapshot{Services: []Service{item}}).Services[0]
 			return nil
 		}
 		for i := range d.Services {
 			if d.Services[i].ID == id {
 				item.ID = id
 				item.Instances = d.Services[i].Instances
+				if item.Protection.Enabled {
+					item.ProtectionStatus = d.Services[i].ProtectionStatus
+				}
 				if item.HealthCheck != d.Services[i].HealthCheck {
 					for j := range item.Instances {
 						item.Instances[j].Health = HealthUnknown
+						item.Instances[j].ConsecutiveFailures = 0
+						item.Instances[j].ConsecutiveSuccesses = 0
+						item.Instances[j].LastHealthyAt = 0
+						item.Instances[j].LastCheckAt = 0
+						item.Instances[j].LastError = ""
 						item.Instances[j].ProbeGeneration++
 					}
 				}
 				d.Services[i] = item
+				item = clone(Snapshot{Services: []Service{item}}).Services[0]
 				return nil
 			}
 		}
@@ -249,7 +339,7 @@ func (s *Store) SaveService(id string, item Service) (Service, error) {
 }
 
 func (s *Store) DeleteService(id string) error {
-	return s.Update(func(d *Snapshot) error {
+	return s.update(func(d *Snapshot) error {
 		for i, item := range d.Services {
 			if item.ID == id {
 				d.Services = append(d.Services[:i], d.Services[i+1:]...)
@@ -257,7 +347,7 @@ func (s *Store) DeleteService(id string) error {
 			}
 		}
 		return bad("not_found")
-	})
+	}, true)
 }
 
 func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, error) {
@@ -269,6 +359,15 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 	if item.Port < 1 || item.Port > 65535 {
 		return Instance{}, bad("invalid_port")
 	}
+	if err := normalizeInstance(&item); err != nil {
+		return Instance{}, err
+	}
+	item.LastCheckAt = 0
+	item.LastHealthyAt = 0
+	item.LastError = ""
+	item.ConsecutiveFailures = 0
+	item.ConsecutiveSuccesses = 0
+	item.LeaseExpired = false
 	item.Health = HealthUnknown
 	item.Source = ""
 	item.LeaseTokenHash = ""
@@ -292,6 +391,7 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 			item.ID = newID()
 			item.ProbeGeneration = 1
 			d.Services[serviceIndex].Instances = append(d.Services[serviceIndex].Instances, item)
+			item = clone(Snapshot{Services: []Service{{Instances: []Instance{item}}}}).Services[0].Instances[0]
 			return nil
 		}
 		for i := range d.Services[serviceIndex].Instances {
@@ -302,6 +402,7 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 				item.ID = id
 				item.ProbeGeneration = d.Services[serviceIndex].Instances[i].ProbeGeneration + 1
 				d.Services[serviceIndex].Instances[i] = item
+				item = clone(Snapshot{Services: []Service{{Instances: []Instance{item}}}}).Services[0].Instances[0]
 				return nil
 			}
 		}
@@ -311,7 +412,7 @@ func (s *Store) SaveInstance(serviceID, id string, item Instance) (Instance, err
 }
 
 func (s *Store) DeleteInstance(serviceID, id string) error {
-	return s.Update(func(d *Snapshot) error {
+	return s.update(func(d *Snapshot) error {
 		for i := range d.Services {
 			if d.Services[i].ID != serviceID {
 				continue
@@ -325,5 +426,5 @@ func (s *Store) DeleteInstance(serviceID, id string) error {
 			break
 		}
 		return bad("not_found")
-	})
+	}, true)
 }

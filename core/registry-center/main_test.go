@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"github.com/fkzhao/lightwight-ns/sdk/go/registration"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -108,5 +110,37 @@ func TestDatabasePathConfiguration(t *testing.T) {
 	t.Setenv("NS_DB_FILE", "/tmp/custom.db")
 	if got := databasePath(); got != "/tmp/custom.db" {
 		t.Fatalf("NS_DB_FILE did not take precedence: %s", got)
+	}
+}
+
+func TestSDKDrainAndScopedMetadata(t *testing.T) {
+	store, err := registry.NewStore(filepath.Join(t.TempDir(), "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.SaveService("", registry.Service{Name: "orders", Namespace: "prod", Group: "blue"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleRegistration(store, w, r) }))
+	defer server.Close()
+	weight := 30
+	lease, err := registration.NewClient(server.URL).RegisterWithOptions(context.Background(), "orders", "127.0.0.1", 8081, registration.Options{Namespace: "prod", Group: "blue", Version: "v2", Weight: &weight, Metadata: map[string]string{"zone": "a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := store.Snapshot()
+	instance := snapshot.Services[0].Instances[0]
+	if instance.Lifecycle != "draining" || instance.Version != "v2" || *instance.Weight != 30 || instance.Metadata["zone"] != "a" {
+		t.Fatalf("SDK metadata or drain lost: %+v", instance)
+	}
+	if err := lease.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.Snapshot().Services[0].Instances) != 0 {
+		t.Fatal("SDK close did not deregister")
 	}
 }

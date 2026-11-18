@@ -26,6 +26,7 @@ type Status struct {
 	Ready           bool   `json:"ready"`
 	RegistryVersion uint64 `json:"registryVersion"`
 	LastSyncAt      string `json:"lastSyncAt"`
+	Stale           bool   `json:"stale"`
 }
 
 type RPCError struct {

@@ -2,8 +2,16 @@ package health
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -119,7 +127,12 @@ func (c *Checker) Run(ctx context.Context) {
 			cursor++
 		case observation := <-results:
 			delete(pending, observation.InstanceID)
-			nextCheck[observation.InstanceID] = time.Now().Add(interval)
+			delay := interval
+			if observation.HealthCheck.IntervalMillis > 0 {
+				delay = time.Duration(observation.HealthCheck.IntervalMillis) * time.Millisecond
+			}
+			delay = time.Duration(float64(delay) * (.9 + rand.Float64()*.2))
+			nextCheck[observation.InstanceID] = time.Now().Add(delay)
 			batch = append(batch, observation)
 			if len(batch) >= 64 {
 				flush()
@@ -136,15 +149,15 @@ func (c *Checker) Run(ctx context.Context) {
 }
 
 func (c *Checker) observe(ctx context.Context, check registry.HealthCheck, instance registry.Instance) registry.ProbeObservation {
-	status := registry.HealthUnhealthy
-	if c.probe(ctx, check, instance) {
-		status = registry.HealthHealthy
+	started := time.Now()
+	err := c.probeError(ctx, check, instance)
+	status := registry.HealthHealthy
+	message := ""
+	if err != nil {
+		status = registry.HealthUnhealthy
+		message = err.Error()
 	}
-	return registry.ProbeObservation{
-		InstanceID: instance.ID, Address: instance.Address, Port: instance.Port,
-		HealthCheck: check, Status: status,
-		Generation: instance.ProbeGeneration,
-	}
+	return registry.ProbeObservation{InstanceID: instance.ID, Address: instance.Address, Port: instance.Port, HealthCheck: check, Status: status, Generation: instance.ProbeGeneration, Error: message, CheckedAt: time.Now().UnixMilli(), DurationMillis: time.Since(started).Milliseconds()}
 }
 
 func (c *Checker) concurrency() int {
@@ -185,20 +198,54 @@ func (c *Checker) RunOnce(ctx context.Context) error {
 }
 
 func (c *Checker) probe(ctx context.Context, check registry.HealthCheck, instance registry.Instance) bool {
+	return c.probeError(ctx, check, instance) == nil
+}
+
+func (c *Checker) probeError(ctx context.Context, check registry.HealthCheck, instance registry.Instance) error {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	if check.TimeoutMillis > 0 {
+		timeout = time.Duration(check.TimeoutMillis) * time.Millisecond
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	target := net.JoinHostPort(instance.Address, fmt.Sprint(instance.Port))
+	if check.Type == "grpc" {
+		var transport credentials.TransportCredentials = insecure.NewCredentials()
+		if check.TLS {
+			config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: check.ServerName}
+			if check.CAPEM != "" {
+				roots := x509.NewCertPool()
+				if !roots.AppendCertsFromPEM([]byte(check.CAPEM)) {
+					return errors.New("invalid health check CA certificate")
+				}
+				config.RootCAs = roots
+			}
+			transport = credentials.NewTLS(config)
+		}
+		connection, err := grpc.NewClient("passthrough:///"+target, grpc.WithTransportCredentials(transport))
+		if err != nil {
+			return err
+		}
+		defer connection.Close()
+		reply, err := healthpb.NewHealthClient(connection).Check(ctx, &healthpb.HealthCheckRequest{Service: check.GRPCService})
+		if err != nil {
+			return err
+		}
+		if reply.Status != healthpb.HealthCheckResponse_SERVING {
+			return fmt.Errorf("gRPC health: %s", reply.Status.String())
+		}
+		return nil
+	}
 	if check.Type != "http" {
 		connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 		if err != nil {
-			return false
+			return err
 		}
 		connection.Close()
-		return true
+		return nil
 	}
 	path := check.Path
 	if path == "" {
@@ -206,17 +253,16 @@ func (c *Checker) probe(ctx context.Context, check registry.HealthCheck, instanc
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+target+path, nil)
 	if err != nil {
-		return false
+		return err
 	}
-	client := http.Client{
-		Timeout:       timeout,
-		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(request)
 	if err != nil {
-		return false
+		return err
 	}
-	response.Body.Close()
-	return response.StatusCode >= 200 && response.StatusCode < 300
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("HTTP health: %d", response.StatusCode)
+	}
+	return nil
 }

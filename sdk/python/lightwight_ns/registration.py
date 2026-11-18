@@ -39,9 +39,14 @@ class RegistrationClient:
                 code = "unknown_error"
             raise RegistrationError(error.code, code) from error
 
-    def register(self, service_name: str, address: str, port: int) -> "RegistrationLease":
+    def register(self, service_name: str, address: str, port: int, *, namespace: str = "default",
+                 group: str = "default", version: str = "", weight: Optional[int] = None,
+                 metadata: Optional[dict] = None) -> "RegistrationLease":
         body = {"serviceName": service_name, "address": address,
                 "port": port, "token": secrets.token_hex(32)}
+        body.update(namespace=namespace, group=group, version=version, metadata=dict(metadata or {}))
+        if weight is not None:
+            body["weight"] = weight
         result = self._request("POST", "/api/registrations", body)
         return RegistrationLease(self, body, result)
 
@@ -83,14 +88,23 @@ class RegistrationLease:
                 with self._lock:
                     self._last_renewal_error = error
 
+    def drain(self) -> None:
+        """Stop new discoveries while background renewal continues."""
+        self._client._request("POST", "/api/registrations/" + self.instance_id + "/drain",
+                              {"token": self._body["token"]})
+
     def close(self) -> None:
         with self._close_lock:
             if self._closed:
                 return
             self._stop.set()
             self._worker.join(timeout=self._client.timeout + 1)
-            self._client._request("DELETE", "/api/registrations/" + self.instance_id,
-                                  {"token": self._body["token"]})
+            try:
+                self._client._request("DELETE", "/api/registrations/" + self.instance_id,
+                                      {"token": self._body["token"]})
+            except RegistrationError as error:
+                if error.status != 404:
+                    raise
             self._closed = True
 
     def __enter__(self) -> "RegistrationLease":

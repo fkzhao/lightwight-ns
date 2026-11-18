@@ -1,9 +1,10 @@
 """Resolve services through a machine-local agent over JSON-RPC 2.0."""
 
 import json
+import random
 import socket
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 
@@ -18,6 +19,7 @@ class AgentStatus:
     ready: bool
     registry_version: int
     last_sync_at: str
+    stale: bool = False
 
 
 class AgentRPCError(RuntimeError):
@@ -63,9 +65,19 @@ class DiscoveryClient:
         result = self._call("discovery.resolve", {"service": service_name})
         return [Endpoint(item["address"], item["port"]) for item in result["endpoints"]]
 
+    def resolve_v2(self, service_name: str, *, namespace: str = "default", group: str = "default",
+                   version: str = "", metadata: Optional[dict] = None, allow_stale: bool = False) -> "DiscoveryResult":
+        result = self._call("discovery.resolveV2", {"service": service_name, "namespace": namespace,
+                            "group": group, "version": version, "metadata": dict(metadata or {}),
+                            "allowStale": allow_stale})
+        endpoints = [Instance(item["instanceId"], item["address"], item["port"], item["weight"],
+                              item.get("version", ""), item.get("metadata", {}), item.get("stale", False))
+                     for item in result["endpoints"]]
+        return DiscoveryResult(result["registryVersion"], endpoints, result.get("stale", False))
+
     def agent_status(self) -> AgentStatus:
         result = self._call("agent.status", {})
-        return AgentStatus(result["ready"], result["registryVersion"], result["lastSyncAt"])
+        return AgentStatus(result["ready"], result["registryVersion"], result["lastSyncAt"], result.get("stale", False))
 
     def close(self) -> None:
         self._stream.close()
@@ -76,3 +88,28 @@ class DiscoveryClient:
 
     def __exit__(self, _type, _value, _traceback):
         self.close()
+
+
+@dataclass(frozen=True)
+class Instance:
+    instance_id: str
+    address: str
+    port: int
+    weight: int
+    version: str = ""
+    metadata: dict = field(default_factory=dict)
+    stale: bool = False
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    registry_version: int
+    endpoints: List[Instance]
+    stale: bool = False
+
+
+def pick_weighted(endpoints: List[Instance]) -> Instance:
+    eligible = [endpoint for endpoint in endpoints if endpoint.weight > 0]
+    if not eligible:
+        raise LookupError("no eligible endpoints")
+    return random.choices(eligible, weights=[endpoint.weight for endpoint in eligible], k=1)[0]

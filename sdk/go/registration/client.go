@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -30,9 +32,10 @@ func (e *APIError) Error() string { return fmt.Sprintf("registration API %d: %s"
 
 type registrationInput struct {
 	ServiceName string `json:"serviceName"`
-	Address     string `json:"address"`
-	Port        int    `json:"port"`
-	Token       string `json:"token"`
+	Options
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+	Token   string `json:"token"`
 }
 
 type registrationResult struct {
@@ -90,11 +93,20 @@ type Lease struct {
 
 // Register starts automatic lease renewal until Close is called.
 func (c *Client) Register(ctx context.Context, serviceName, address string, port int) (*Lease, error) {
+	return c.RegisterWithOptions(ctx, serviceName, address, port, Options{})
+}
+
+func (c *Client) RegisterWithOptions(ctx context.Context, serviceName, address string, port int, options Options) (*Lease, error) {
+	options.Metadata = maps.Clone(options.Metadata)
+	if options.Weight != nil {
+		weight := *options.Weight
+		options.Weight = &weight
+	}
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		return nil, err
 	}
-	input := registrationInput{ServiceName: serviceName, Address: address, Port: port, Token: hex.EncodeToString(secret)}
+	input := registrationInput{ServiceName: serviceName, Address: address, Port: port, Token: hex.EncodeToString(secret), Options: options}
 	var result registrationResult
 	if err := c.request(ctx, http.MethodPost, "/api/registrations", input, &result); err != nil {
 		return nil, err
@@ -157,8 +169,25 @@ func (l *Lease) Close(ctx context.Context) error {
 		return ctx.Err()
 	}
 	if err := l.client.request(ctx, http.MethodDelete, "/api/registrations/"+l.InstanceID(), map[string]string{"token": l.input.Token}, nil); err != nil {
-		return err
+		var apiError *APIError
+		if !errors.As(err, &apiError) || apiError.Status != http.StatusNotFound {
+			return err
+		}
 	}
 	l.closed = true
 	return nil
+}
+
+// Options are immutable registration metadata for this lease.
+type Options struct {
+	Namespace string            `json:"namespace,omitempty"`
+	Group     string            `json:"group,omitempty"`
+	Version   string            `json:"version,omitempty"`
+	Weight    *int              `json:"weight,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+}
+
+// Drain removes the instance from discovery while renewal continues.
+func (l *Lease) Drain(ctx context.Context) error {
+	return l.client.request(ctx, http.MethodPost, "/api/registrations/"+l.InstanceID()+"/drain", map[string]string{"token": l.input.Token}, nil)
 }

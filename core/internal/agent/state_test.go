@@ -6,6 +6,7 @@ import (
 	"net/rpc"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/fkzhao/lightwight-ns/core/internal/registry"
 )
@@ -63,5 +64,23 @@ func TestSyncAndLocalDiscoveryTracksHealth(t *testing.T) {
 	reply, err = state.Resolve("orders")
 	if err != nil || len(reply.Endpoints) != 0 {
 		t.Fatalf("unhealthy endpoint remained available: %+v, %v", reply, err)
+	}
+}
+
+func TestAgentRejectsExpiredSnapshot(t *testing.T) {
+	state := &State{MaxStale: time.Second}
+	state.Apply(registry.Snapshot{Version: 1, Services: []registry.Service{{Name: "orders"}}})
+	state.mu.Lock()
+	state.lastSync = time.Now().Add(-2 * time.Second)
+	state.mu.Unlock()
+	if _, err := state.Resolve("orders"); err == nil {
+		t.Fatal("expired snapshot was served")
+	}
+	if !state.Status().Stale {
+		t.Fatal("status did not report staleness")
+	}
+	state.MarkSynced()
+	if _, err := state.Resolve("orders"); err != nil {
+		t.Fatal(err)
 	}
 }

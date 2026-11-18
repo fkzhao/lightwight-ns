@@ -66,6 +66,18 @@ func handleRequest(line []byte, state *State) response {
 	switch input.Method {
 	case "agent.status":
 		reply.Result = state.Status()
+	case "discovery.resolveV2":
+		var params registry.ResolveQuery
+		if err := json.Unmarshal(input.Params, &params); err != nil || params.Service == "" {
+			reply.Error = &rpcError{Code: -32602, Message: "invalid params"}
+			return reply
+		}
+		result, err := state.ResolveV2(params)
+		if err != nil {
+			reply.Error = resolveError(err)
+		} else {
+			reply.Result = result
+		}
 	case "discovery.resolve":
 		var params struct {
 			Service string `json:"service"`
@@ -76,12 +88,7 @@ func handleRequest(line []byte, state *State) response {
 		}
 		resolved, err := state.Resolve(params.Service)
 		if err != nil {
-			var domain registry.DomainError
-			if errors.As(err, &domain) && domain.Code == "not_found" {
-				reply.Error = &rpcError{Code: -32004, Message: "service not found"}
-			} else {
-				reply.Error = &rpcError{Code: -32001, Message: "agent not ready"}
-			}
+			reply.Error = resolveError(err)
 			return reply
 		}
 		reply.Result = struct {
@@ -92,4 +99,17 @@ func handleRequest(line []byte, state *State) response {
 		reply.Error = &rpcError{Code: -32601, Message: "method not found"}
 	}
 	return reply
+}
+
+func resolveError(err error) *rpcError {
+	var domain registry.DomainError
+	if errors.As(err, &domain) {
+		if domain.Code == "not_found" {
+			return &rpcError{Code: -32004, Message: "service not found"}
+		}
+		if domain.Code == "stale_snapshot" {
+			return &rpcError{Code: -32002, Message: "agent snapshot expired"}
+		}
+	}
+	return &rpcError{Code: -32001, Message: "agent not ready"}
 }

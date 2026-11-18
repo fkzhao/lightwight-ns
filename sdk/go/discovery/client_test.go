@@ -63,3 +63,15 @@ func TestResolveOverBothTransports(t *testing.T) {
 		})
 	}
 }
+
+func TestWeightedSelectionSkipsZeroWeight(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		endpoint, err := PickWeighted([]Instance{{InstanceID: "disabled", Weight: 0}, {InstanceID: "enabled", Weight: 100}})
+		if err != nil || endpoint.InstanceID != "enabled" {
+			t.Fatalf("weighted selection: %+v, %v", endpoint, err)
+		}
+	}
+	if _, err := PickWeighted(nil); err == nil {
+		t.Fatal("empty result should fail selection")
+	}
+}

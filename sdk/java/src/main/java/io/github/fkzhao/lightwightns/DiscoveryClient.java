@@ -1,6 +1,7 @@
 package io.github.fkzhao.lightwightns;
 
 import com.google.gson.JsonArray;
+import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.io.BufferedReader;
@@ -66,10 +67,15 @@ public final class DiscoveryClient implements AutoCloseable {
         return result;
     }
 
+    public DiscoveryResult resolveV2(ResolveQuery query) throws IOException {
+        Gson gson = new Gson();
+        return gson.fromJson(call("discovery.resolveV2", gson.toJsonTree(query).getAsJsonObject()), DiscoveryResult.class);
+    }
+
     public AgentStatus agentStatus() throws IOException {
         JsonObject status = call("agent.status", new JsonObject());
         return new AgentStatus(status.get("ready").getAsBoolean(),
-                status.get("registryVersion").getAsLong(), status.get("lastSyncAt").getAsString());
+                status.get("registryVersion").getAsLong(), status.get("lastSyncAt").getAsString(), status.has("stale") && status.get("stale").getAsBoolean());
     }
 
     @Override public void close() throws IOException { socket.close(); }

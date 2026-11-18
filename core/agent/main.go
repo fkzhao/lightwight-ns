@@ -70,11 +70,17 @@ func run() error {
 	defer tcpListener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	state := &agent.State{}
+	maxStale, err := time.ParseDuration(env("NS_AGENT_MAX_STALE", "30s"))
+	if err != nil || maxStale < time.Second {
+		return errors.New("NS_AGENT_MAX_STALE must be at least 1s")
+	}
+	state := &agent.State{MaxStale: maxStale}
 	go func() {
 		for {
-			if err := agent.SyncOnce(ctx, state, center); err != nil {
+			if err := agent.WatchOnce(ctx, state, center); err != nil {
 				log.Printf("registry sync: %v", err)
+			} else {
+				continue
 			}
 			select {
 			case <-ctx.Done():

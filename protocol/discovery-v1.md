@@ -32,10 +32,10 @@ Successful response:
 {"jsonrpc":"2.0","id":2,"result":{"ready":true,"registryVersion":12,"lastSyncAt":"2026-01-01T00:00:00Z"}}
 ```
 
-`ready` becomes true after the first successful sync. `lastSyncAt` is an RFC 3339 timestamp, or an empty string before the first sync. During a center outage, the agent retains its last successful snapshot.
+`ready` becomes true after the first successful sync. `lastSyncAt` is an RFC 3339 timestamp, or an empty string before the first sync. During a center outage, the Agent retains its last successful snapshot. After `NS_AGENT_MAX_STALE` (default 30 seconds), lookups return error -32002. Status includes a `stale` boolean.
 
 ## Errors
 
-Errors use the standard JSON-RPC error object and preserve the request ID. Codes are `-32700` (parse error), `-32600` (invalid request), `-32601` (method not found), `-32602` (invalid params), `-32001` (agent not ready), and `-32004` (service not found). The TCP/Unix protocol is intended for local use; the agent does not provide authentication.
+Errors use the standard JSON-RPC error object and preserve the request ID. Codes are `-32700` (parse error), `-32600` (invalid request), `-32601` (method not found), `-32602` (invalid params), `-32001` (agent not ready), `-32002` (snapshot expired), and `-32004` (service not found). The TCP/Unix protocol is intended for local use; the agent does not provide authentication.
 
 The center-to-agent snapshot sync is a separate Go `net/rpc` protocol on port 9090. SDKs never call that protocol.

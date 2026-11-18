@@ -26,8 +26,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export type ServiceInput = Pick<Service, "name" | "description"> & { healthCheck: HealthCheck }
-export type InstanceInput = Pick<Instance, "address" | "port" | "enabled">
+export type ServiceInput = Pick<Service, "name" | "description" | "namespace" | "group" | "protection"> & { healthCheck: HealthCheck }
+export type InstanceInput = Pick<Instance, "address" | "port" | "enabled"> & Partial<Pick<Instance, "version" | "weight" | "metadata" | "lifecycle">>
 
 export const api = {
   snapshot: () => request<RegistrySnapshot>("/snapshot"),
@@ -41,6 +41,10 @@ export const api = {
     request<Instance>("/services/" + serviceId + "/instances" + (id ? "/" + id : ""), {
       method: id ? "PUT" : "POST",
       body: JSON.stringify(value),
+    }),
+  setInstanceState: (serviceId: string, id: string, action: "drain" | "enabled", enabled?: boolean) =>
+    request<void>("/services/" + serviceId + "/instances/" + id + "/" + action, {
+      method: "POST", body: action === "enabled" ? JSON.stringify({ enabled }) : undefined,
     }),
   removeInstance: (serviceId: string, id: string) =>
     request<void>("/services/" + serviceId + "/instances/" + id, { method: "DELETE" }),

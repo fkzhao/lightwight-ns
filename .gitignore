@@ -8,3 +8,5 @@ sdk/java/target/
 *.pyc
 sdk/python/*.egg-info/
 sdk/python/build/
+
+.playwright-mcp/

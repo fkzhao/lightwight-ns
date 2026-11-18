@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { BrowserRouter, Navigate, Route, Routes } from "react-router"
 import { useTranslation } from "react-i18next"
-import { Activity, Globe2, Moon, Pencil, Plus, Search, Server, Sun, Trash2, TriangleAlert } from "lucide-react"
+import { Activity, LogOut, Power, Globe2, Moon, Pencil, Plus, Search, Server, Sun, Trash2, TriangleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -14,12 +14,15 @@ import { Toaster } from "@/components/ui/sonner"
 import { useTheme } from "@/components/theme-provider"
 import { i18n } from "@/i18n"
 import { RegistryProvider, useRegistry } from "@/features/registry/RegistryProvider"
-import { DeleteDialog, InstanceFormDialog, ServiceFormDialog } from "@/features/registry/RegistryForms"
+import { DeleteDialog, DrainDialog, InstanceFormDialog, ServiceFormDialog } from "@/features/registry/RegistryForms"
 import type { Instance, Service } from "@/types/registry"
 
 function HealthBadge({ instance }: { instance: Instance }) {
   const { t } = useTranslation()
   if (!instance.enabled) return <Badge variant="outline">{t("health.disabled")}</Badge>
+  if (instance.lifecycle === "draining") return <Badge variant="outline">{t("health.draining")}</Badge>
+  if (instance.leaseExpired) return <Badge variant="destructive">{t("health.expired")}</Badge>
+  if (instance.weight === 0) return <Badge variant="outline">{t("health.zeroWeight")}</Badge>
   if (instance.health === "healthy") return <Badge variant="success">{t("health.healthy")}</Badge>
   if (instance.health === "unhealthy") return <Badge variant="destructive">{t("health.unhealthy")}</Badge>
   return <Badge variant="outline">{t("health.unknown")}</Badge>
@@ -31,16 +34,19 @@ function ServiceCard({ service }: { service: Service }) {
   const [instanceFormOpen, setInstanceFormOpen] = useState(false)
   const [editingInstance, setEditingInstance] = useState<Instance | undefined>()
   const [deleteServiceOpen, setDeleteServiceOpen] = useState(false)
+  const { setInstanceState } = useRegistry()
+  const [drainingInstance, setDrainingInstance] = useState<Instance | undefined>()
   const [deletingInstance, setDeletingInstance] = useState<Instance | undefined>()
-  const available = service.instances.filter((instance) => instance.enabled && instance.health === "healthy").length
+  const available = service.instances.filter((instance) => instance.enabled && instance.health === "healthy" && instance.lifecycle !== "draining" && !instance.leaseExpired && instance.weight !== 0).length
 
   return <Card>
     <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div className="flex min-w-0 flex-col gap-2">
         <div className="flex flex-wrap items-center gap-3">
           <CardTitle className="text-lg">{service.name}</CardTitle>
-          <Badge variant="outline">{service.healthCheck.type === "http" ? t("health.http") : t("health.tcp")}{service.healthCheck.type === "http" ? " " + service.healthCheck.path : ""}</Badge>
+          <Badge variant="outline">{t("health." + service.healthCheck.type)}{service.healthCheck.type === "http" ? " " + service.healthCheck.path : ""}</Badge>
         </div>
+        <p className="text-xs text-muted-foreground">{t("services.namespace")}: {service.namespace} · {t("services.group")}: {service.group}</p>
         <CardDescription>{service.description || t("services.noDescription")}</CardDescription>
         <p className="text-xs text-muted-foreground">{t("services.availability", { available, total: service.instances.length })}</p>
       </div>
@@ -50,6 +56,8 @@ function ServiceCard({ service }: { service: Service }) {
       </div>
     </CardHeader>
     <CardContent>
+      {service.protectionStatus?.active && <Alert className="mb-4"><TriangleAlert /><AlertTitle>{t("protection.active")}</AlertTitle><AlertDescription>{t("protection." + (service.protectionStatus.reason ?? "renewal_drop"))} {t("protection.activeHelp")}</AlertDescription></Alert>}
+
       <div className="mb-4 flex items-center gap-2">
         <Server className="size-4 text-muted-foreground" />
         <h3 className="text-sm font-medium">{t("instances.title")}</h3>
@@ -67,14 +75,18 @@ function ServiceCard({ service }: { service: Service }) {
             <TableHeader><TableRow>
               <TableHead>{t("instances.address")}</TableHead>
               <TableHead>{t("instances.port")}</TableHead>
+              <TableHead>{t("instances.metadata")}</TableHead>
               <TableHead>{t("instances.health")}</TableHead>
               <TableHead className="text-right">{t("common.actions")}</TableHead>
             </TableRow></TableHeader>
             <TableBody>{service.instances.map((instance) => <TableRow key={instance.id}>
               <TableCell className="font-mono text-xs"><div className="flex items-center gap-2">{instance.address}{instance.source === "sdk" && <Badge variant="outline">{t("instances.sdkManaged")}</Badge>}</div></TableCell>
               <TableCell className="font-mono text-xs">{instance.port}</TableCell>
-              <TableCell><HealthBadge instance={instance} /></TableCell>
+              <TableCell><div className="flex flex-col gap-1 text-xs"><span>{t("instances.version")}: {instance.version || t("instances.unspecified")}</span><span>{t("instances.weight")}: {instance.weight ?? 100}</span>{instance.metadata && Object.keys(instance.metadata).length > 0 && <code className="max-w-48 truncate" title={JSON.stringify(instance.metadata)}>{JSON.stringify(instance.metadata)}</code>}</div></TableCell>
+              <TableCell><div className="flex max-w-64 flex-col gap-1"><HealthBadge instance={instance} />{instance.lastError && <p className="truncate text-xs text-muted-foreground" title={instance.lastError}>{instance.lastError}</p>}{instance.lastCheckAt && <span className="text-xs text-muted-foreground">{t("health.checkedAt")}: {new Date(instance.lastCheckAt).toLocaleTimeString(i18n.language)}</span>}</div></TableCell>
               <TableCell><div className="flex justify-end gap-1">
+                <Button variant="ghost" size="icon" aria-label={t(instance.enabled ? "instances.disable" : "instances.enable")} onClick={() => void setInstanceState(service.id, instance.id, "enabled", !instance.enabled)}><Power /></Button>
+                {instance.lifecycle !== "draining" && <Button variant="ghost" size="icon" aria-label={t("instances.drain")} onClick={() => setDrainingInstance(instance)}><LogOut /></Button>}
                 {instance.source !== "sdk" && <Button variant="ghost" size="icon" aria-label={t("instances.edit")} onClick={() => { setEditingInstance(instance); setInstanceFormOpen(true) }}><Pencil /></Button>}
                 {instance.source !== "sdk" && <Button variant="ghost" size="icon" aria-label={t("instances.delete")} onClick={() => setDeletingInstance(instance)}><Trash2 /></Button>}
               </div></TableCell>
@@ -90,6 +102,7 @@ function ServiceCard({ service }: { service: Service }) {
     {serviceFormOpen && <ServiceFormDialog open={serviceFormOpen} onOpenChange={setServiceFormOpen} current={service} />}
     {instanceFormOpen && <InstanceFormDialog key={editingInstance?.id ?? "new"} open={instanceFormOpen} onOpenChange={setInstanceFormOpen} service={service} current={editingInstance} />}
     {deleteServiceOpen && <DeleteDialog open={deleteServiceOpen} onOpenChange={setDeleteServiceOpen} serviceId={service.id} description={t("services.deleteHelp")} />}
+    {drainingInstance && <DrainDialog open={!!drainingInstance} onOpenChange={(open) => { if (!open) setDrainingInstance(undefined) }} serviceId={service.id} instanceId={drainingInstance.id} />}
     {deletingInstance && <DeleteDialog open={!!deletingInstance} onOpenChange={(open) => { if (!open) setDeletingInstance(undefined) }} serviceId={service.id} instanceId={deletingInstance.id} description={t("instances.deleteHelp")} />}
   </Card>
 }
@@ -105,8 +118,8 @@ function RegistryPage() {
     localStorage.setItem("ns-language", next)
     void i18n.changeLanguage(next)
   }
-  const filtered = snapshot?.services.filter((service) => service.name.toLowerCase().includes(query.toLowerCase())) ?? []
-  const available = snapshot?.services.reduce((sum, service) => sum + service.instances.filter((item) => item.enabled && item.health === "healthy").length, 0) ?? 0
+  const filtered = snapshot?.services.filter((service) => [service.name, service.namespace, service.group].join(" ").toLowerCase().includes(query.toLowerCase())) ?? []
+  const available = snapshot?.services.reduce((sum, service) => sum + service.instances.filter((item) => item.enabled && item.health === "healthy" && item.lifecycle !== "draining" && !item.leaseExpired && item.weight !== 0).length, 0) ?? 0
   return <div className="min-h-svh bg-background">
     <header className="border-b border-border">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">

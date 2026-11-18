@@ -42,3 +42,24 @@ func TestJSONRPCDiscovery(t *testing.T) {
 		t.Fatalf("unexpected JSON-RPC response: %s", line)
 	}
 }
+
+func TestResolveV2OverWire(t *testing.T) {
+	state := &State{}
+	weight := 25
+	state.Apply(registry.Snapshot{Version: 9, Services: []registry.Service{{Name: "orders", Namespace: "prod", Group: "blue", Instances: []registry.Instance{{ID: "one", Address: "10.0.0.1", Port: 8080, Enabled: true, Health: registry.HealthHealthy, Version: "v2", Weight: &weight, Metadata: map[string]string{"zone": "a"}}}}}})
+	client, server := net.Pipe()
+	defer client.Close()
+	go ServeConn(server, state)
+	if _, err := fmt.Fprintln(client, `{"jsonrpc":"2.0","id":2,"method":"discovery.resolveV2","params":{"service":"orders","namespace":"prod","group":"blue","version":"v2","metadata":{"zone":"a"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Result registry.ResolveResult `json:"result"`
+	}
+	if err := json.NewDecoder(client).Decode(&reply); err != nil {
+		t.Fatal(err)
+	}
+	if len(reply.Result.Endpoints) != 1 || reply.Result.Endpoints[0].InstanceID != "one" || reply.Result.Endpoints[0].Weight != 25 {
+		t.Fatalf("unexpected v2 wire reply: %+v", reply)
+	}
+}

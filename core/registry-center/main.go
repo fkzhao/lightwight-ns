@@ -200,6 +200,28 @@ func handleResource(store *registry.Store, w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	if len(parts) == 4 && parts[1] == "instances" && r.Method == http.MethodPost {
+		var enabled *bool
+		draining := parts[3] == "drain"
+		if parts[3] == "enabled" {
+			var input struct {
+				Enabled bool `json:"enabled"`
+			}
+			if !decode(w, r, &input) {
+				return
+			}
+			enabled = &input.Enabled
+		} else if !draining {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if err := store.SetInstanceState(serviceID, parts[2], enabled, draining); err != nil {
+			respondError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if parts[1] != "instances" || len(parts) > 3 {
 		writeError(w, http.StatusNotFound, "not_found")
 		return
@@ -259,6 +281,17 @@ func handleRegistration(store *registry.Store, w http.ResponseWriter, r *http.Re
 		return
 	}
 	var input registry.RegistrationToken
+	if len(parts) == 2 && parts[1] == "drain" && r.Method == http.MethodPost {
+		if !decode(w, r, &input) {
+			return
+		}
+		if err := store.DrainRegistration(parts[0], input.Token); err != nil {
+			respondError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "renew" && r.Method == http.MethodPost {
 		if !decode(w, r, &input) {
 			return
@@ -310,7 +343,7 @@ func respondError(w http.ResponseWriter, err error) {
 		if domain.Code == "registration_forbidden" {
 			status = http.StatusForbidden
 		}
-		if domain.Code == "registration_expired" {
+		if domain.Code == "registration_expired" || domain.Code == "registration_retired" {
 			status = http.StatusGone
 		}
 		if strings.HasPrefix(domain.Code, "duplicate_") || strings.HasSuffix(domain.Code, "_has_instances") || domain.Code == "port_in_use" || domain.Code == "registration_conflict" {

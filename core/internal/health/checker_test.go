@@ -47,7 +47,7 @@ func TestHTTPHealthRemovesAndRestoresDiscoveryEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := store.SaveService("", registry.Service{Name: "orders", HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready"}})
+	service, err := store.SaveService("", registry.Service{Name: "orders", HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready", FailureThreshold: 1, SuccessThreshold: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRunPublishesFastProbeBeforeSlowProbeCompletes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		service, err := store.SaveService("", registry.Service{Name: item.name, HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready"}})
+		service, err := store.SaveService("", registry.Service{Name: item.name, HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready", FailureThreshold: 1, SuccessThreshold: 1}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -229,7 +229,7 @@ func TestLeaseExpiryContinuesWhileProbeIsBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	if _, err := store.SaveService("", registry.Service{Name: "orders", HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready"}}); err != nil {
+	if _, err := store.SaveService("", registry.Service{Name: "orders", HealthCheck: registry.HealthCheck{Type: "http", Path: "/ready", FailureThreshold: 1, SuccessThreshold: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.RegisterInstance(registry.RegistrationInput{
